@@ -1,0 +1,187 @@
+version: "3.9"
+
+services:
+  # ── 应用服务 ─────────────────────────────────────────────────────────────
+  app:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: bill_rag_app
+    ports:
+      - "8000:8000"
+    environment:
+      # 服务地址：docker 内部使用服务名，覆盖 .env 中的 localhost 配置
+      - DATABASE_URL=postgresql+asyncpg://postgres:postgres@postgres:5432/bill_rag
+      - MILVUS_HOST=milvus-standalone
+      - MILVUS_PORT=19530
+      - REDIS_URL=redis://redis:6379/0
+      # LLM：从宿主机环境变量读取（本地先 export OPENAI_API_KEY=xxx）
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - OPENAI_BASE_URL=${OPENAI_BASE_URL:-https://dashscope.aliyuncs.com/compatible-mode/v1}
+      - OPENAI_MODEL=${OPENAI_MODEL:-qwen-max}
+      - LLM_PROVIDER=${LLM_PROVIDER:-openai}
+      # 视觉模型
+      - VISION_ENABLED=${VISION_ENABLED:-true}
+      - VISION_MODEL=${VISION_MODEL:-qwen-vl-max}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - DEBUG=false
+    volumes:
+      - ./data:/app/data
+      - ./config:/app/config:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - bill_rag_net
+      - milvus_default
+
+  # ── PostgreSQL ────────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: bill_rag_postgres
+    environment:
+      POSTGRES_DB: bill_rag
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5432:5432"    # 暴露到宿主机，本地开发直接连 localhost:5432
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - bill_rag_net
+
+  # ── Redis ─────────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: bill_rag_redis
+    command: redis-server --maxmemory 2gb --maxmemory-policy allkeys-lru
+    ports:
+      - "6379:6379"    # 暴露到宿主机，本地开发直接连 localhost:6379
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - bill_rag_net
+
+  # ── Milvus (Standalone) ───────────────────────────────────────────────────
+  # 已注释：使用 Docker 环境中已有的 milvus-standalone 容器（网络: milvus_default）
+  # app 服务已通过 networks: milvus_default 直接访问，MILVUS_HOST=milvus-standalone
+  # 若需要在本项目内独立启动 Milvus，取消以下注释并同步注释掉 networks 中的 milvus_default external 配置
+
+  # etcd:
+  #   image: quay.io/coreos/etcd:v3.5.11
+  #   container_name: bill_rag_etcd
+  #   environment:
+  #     - ETCD_AUTO_COMPACTION_MODE=revision
+  #     - ETCD_AUTO_COMPACTION_RETENTION=1000
+  #     - ETCD_QUOTA_BACKEND_BYTES=4294967296
+  #     - ETCD_SNAPSHOT_COUNT=50000
+  #   volumes:
+  #     - etcd_data:/etcd
+  #   command: etcd -advertise-client-urls=http://127.0.0.1:2379 -listen-client-urls http://0.0.0.0:2379 --data-dir /etcd
+  #   networks:
+  #     - bill_rag_net
+
+  # minio:
+  #   image: minio/minio:RELEASE.2023-03-13T19-46-17Z
+  #   container_name: bill_rag_minio
+  #   environment:
+  #     MINIO_ACCESS_KEY: minioadmin
+  #     MINIO_SECRET_KEY: minioadmin
+  #   volumes:
+  #     - minio_data:/minio_data
+  #   command: minio server /minio_data --console-address ":9001"
+  #   healthcheck:
+  #     test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+  #     interval: 30s
+  #     timeout: 20s
+  #     retries: 3
+  #   networks:
+  #     - bill_rag_net
+
+  # milvus-standalone:
+  #   image: milvusdb/milvus:v2.4.4
+  #   container_name: bill_rag_milvus
+  #   command: ["milvus", "run", "standalone"]
+  #   security_opt:
+  #     - seccomp:unconfined
+  #   environment:
+  #     ETCD_ENDPOINTS: etcd:2379
+  #     MINIO_ADDRESS: minio:9000
+  #   volumes:
+  #     - milvus_data:/var/lib/milvus
+  #   ports:
+  #     - "19530:19530"
+  #     - "9091:9091"
+  #   depends_on:
+  #     - etcd
+  #     - minio
+  #   healthcheck:
+  #     test: ["CMD", "curl", "-f", "http://localhost:9091/healthz"]
+  #     interval: 30s
+  #     timeout: 20s
+  #     retries: 10
+  #   networks:
+  #     - bill_rag_net
+
+  # ── Prometheus ────────────────────────────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:v2.52.0
+    container_name: bill_rag_prometheus
+    volumes:
+      - ./docker/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.retention.time=30d"
+    ports:
+      - "9090:9090"
+    networks:
+      - bill_rag_net
+
+  # ── Grafana ───────────────────────────────────────────────────────────────
+  grafana:
+    image: grafana/grafana:10.4.2
+    container_name: bill_rag_grafana
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin123
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./docker/grafana/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ./docker/grafana/datasources:/etc/grafana/provisioning/datasources:ro
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+    networks:
+      - bill_rag_net
+
+volumes:
+  postgres_data:
+  redis_data:
+  # etcd_data:    # 使用外部 Milvus 时不需要
+  # minio_data:   # 使用外部 Milvus 时不需要
+  # milvus_data:  # 使用外部 Milvus 时不需要
+  prometheus_data:
+  grafana_data:
+
+networks:
+  bill_rag_net:
+    driver: bridge
+  milvus_default:
+    # 引用 Docker 环境中已存在的 milvus_default 网络（由外部 Milvus 创建）
+    # 使 app 容器可通过容器名 milvus-standalone 直接访问向量库
+    external: true
