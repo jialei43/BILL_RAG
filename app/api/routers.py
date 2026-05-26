@@ -24,33 +24,47 @@ from fastapi import (
     HTTPException,       # HTTP 错误（如 404、403）
     UploadFile,          # 上传文件对象
     File,                # 文件参数标记
+    Form,                # multipart/form-data 文本字段标记
     BackgroundTasks,     # 后台任务（不阻塞当前请求的异步处理）
     Query,               # URL 查询参数（如 ?page=1&size=20）
     status               # HTTP 状态码常量
 )
 from fastapi.security import OAuth2PasswordRequestForm  # 兼容 Swagger UI 的 OAuth2 表单登录
 from fastapi import Request as FastAPIRequest           # 用于读取原始请求体
-from fastapi.responses import StreamingResponse, Response
+from fastapi.responses import StreamingResponse, Response, JSONResponse
 # StreamingResponse：流式响应（用于 SSE 实时推送）
 # Response：通用响应（可自定义 Content-Type）
 
+import threading
+
 from sqlalchemy.ext.asyncio import AsyncSession   # 异步数据库会话
 from sqlalchemy import select, func               # select：构建查询；func：SQL 函数（COUNT、SUM）
+from sqlalchemy import Numeric, update as sa_update
 from loguru import logger                         # 日志
+
+# ── 批次追踪（内存级，服务重启后清零，批次生命周期短暂，无需持久化）────────────────
+# batch_id → [doc_id, ...]：记录每个批次包含的文档 ID
+_batch_registry: dict[str, list[str]] = {}
+# 已取消的批次集合（某文件失败后整批终止）
+_batch_cancelled: set[str] = set()
+_batch_lock = threading.Lock()
 
 from config.settings import settings              # 配置
 from app.core.auth import (
-    get_current_user,        # 依赖：验证 Token，返回当前用户
-    get_admin_user,          # 依赖：验证 Token 且必须是管理员
-    TokenData,               # Token 数据结构
-    verify_password,         # 密码验证函数
-    get_password_hash,       # 密码哈希函数
-    create_access_token,     # 生成 JWT Token
+    get_current_user,               # 依赖：验证 Token，返回当前用户
+    get_admin_user,                 # 依赖：向后兼容别名 → get_super_admin
+    get_super_admin,                # 依赖：仅超级管理员
+    get_tenant_admin_or_above,      # 依赖：租户管理员或超级管理员
+    TokenData,                      # Token 数据结构
+    verify_password,                # 密码验证函数
+    get_password_hash,              # 密码哈希函数
+    create_access_token,            # 生成 JWT Token
 )
 from app.core.database import get_db              # 依赖：获取数据库会话
 from app.models.db_models import (
     Tenant, User, Document, DocumentChunk, QueryLog, DocumentStatus,
     BillRecord, BillVersion,  # 票据生命周期模型
+    UserRole,
 )
 # 导入所有数据库模型类
 from app.models.schemas import *                  # 导入所有 Pydantic Schema（请求/响应结构）
@@ -114,7 +128,7 @@ async def login(
     token = create_access_token({
         "user_id": user.id,
         "tenant_id": user.tenant_id,
-        "is_admin": user.is_admin,
+        "role": user.role.value if hasattr(user.role, "value") else str(user.role),
     })
 
     return TokenResponse(
@@ -132,28 +146,51 @@ async def register_user(
     db: AsyncSession = Depends(get_db),
 ):
     """
-    注册新用户（需要已登录，只能在自己的租户下注册）
+    注册新用户
     POST /api/v1/auth/register
-    status_code=201：HTTP 201 Created（资源创建成功）
+
+    权限规则：
+    - super_admin：可在任意租户创建 tenant_admin 或 user（通过 tenant_id 指定目标租户）
+    - tenant_admin：只能在自己的租户创建 user（role 只能是 user）
+    - user：无权创建账号（403）
     """
+    # 普通用户无权创建账号
+    if not current_user.is_tenant_admin_or_above:
+        raise HTTPException(status_code=403, detail="无权创建用户，至少需要租户管理员权限")
+
+    # 确定目标租户：super_admin 可指定，其他角色只能在自己的租户内创建
+    if request.tenant_id:
+        if not current_user.is_super_admin:
+            raise HTTPException(status_code=403, detail="只有超级管理员可以指定目标租户")
+        target_tenant_id = request.tenant_id
+        # 验证目标租户存在
+        if not await db.get(Tenant, target_tenant_id):
+            raise HTTPException(status_code=404, detail="目标租户不存在")
+    else:
+        target_tenant_id = current_user.tenant_id
+
+    # 租户管理员只能创建 user 角色，不能创建 tenant_admin
+    target_role = request.role  # 已由 Schema 限制为 tenant_admin 或 user
+    if current_user.role == "tenant_admin" and target_role != "user":
+        raise HTTPException(status_code=403, detail="租户管理员只能创建普通用户（user）账号")
+
     # 检查用户名是否已存在
     existing = await db.execute(select(User).where(User.username == request.username))
     if existing.scalar_one_or_none():
         raise HTTPException(status_code=409, detail="用户名已存在")
-        # 409 Conflict：资源冲突（已存在同名资源）
 
-    # 创建新用户（归属于当前登录用户的租户）
     user = User(
         id=str(uuid.uuid4()),
-        tenant_id=current_user.tenant_id,              # 新用户自动归属于当前租户
+        tenant_id=target_tenant_id,
         username=request.username,
         email=request.email,
-        hashed_password=get_password_hash(request.password),  # 哈希后再存储
-        is_admin=request.is_admin and current_user.is_admin,
-        # 只有当前用户是管理员时，才能创建管理员（防止权限提升）
+        hashed_password=get_password_hash(request.password),
+        role=UserRole(target_role),
     )
-    db.add(user)        # 加入数据库会话（未提交）
-    return user         # FastAPI 自动调用 db.commit()（通过 get_db 依赖）
+    db.add(user)
+    await db.flush()
+    await db.refresh(user)
+    return user
 
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -183,6 +220,35 @@ def _save_upload(file: UploadFile, tenant_id: str) -> str:
     return str(file_path)   # 返回文件的完整路径
 
 
+async def _cancel_batch(batch_id: str, failed_doc_id: str, reason: str):
+    """某文件失败时，将同批所有仍在 PROCESSING 的文件改为 FAILED，并标记批次取消。"""
+    with _batch_lock:
+        if batch_id in _batch_cancelled:
+            return  # 已经处理过，避免重复
+        _batch_cancelled.add(batch_id)
+        sibling_ids = [d for d in _batch_registry.get(batch_id, []) if d != failed_doc_id]
+
+    if not sibling_ids:
+        return
+
+    from app.core.database import AsyncSessionLocal
+    async with AsyncSessionLocal() as session:
+        await session.execute(
+            sa_update(Document)
+            .where(Document.id.in_(sibling_ids), Document.status == DocumentStatus.PROCESSING)
+            .values(
+                status=DocumentStatus.FAILED,
+                error_msg=f"批次中其他文件解析失败，已终止。失败文件: {failed_doc_id[:8]}… 原因: {reason[:200]}",
+            )
+        )
+        await session.commit()
+
+    logger.warning(
+        f"[batch] 批次 {batch_id} 已取消，{len(sibling_ids)} 个文件标记为失败 "
+        f"触发文件={failed_doc_id[:8]}"
+    )
+
+
 async def _update_doc_status(
     doc_id: str,
     status,
@@ -191,6 +257,7 @@ async def _update_doc_status(
 ):
     """更新数据库中文档的处理状态，在主事件循环内执行，避免跨循环操作 asyncpg 连接。"""
     from app.core.database import AsyncSessionLocal
+    from app.services.metrics import metrics as _metrics
     async with AsyncSessionLocal() as session:
         doc = await session.get(Document, doc_id)
         if doc:
@@ -203,11 +270,61 @@ async def _update_doc_status(
                 doc.error_msg = error
             await session.commit()
 
+            # 文档处理完成后，从数据库汇总该租户的总 chunk 数，更新 Prometheus Gauge
+            if status == DocumentStatus.COMPLETED:
+                try:
+                    total_q = select(func.coalesce(func.sum(Document.chunk_count), 0)).where(
+                        Document.tenant_id == doc.tenant_id,
+                        Document.status == DocumentStatus.COMPLETED,
+                    )
+                    total_chunks = (await session.execute(total_q)).scalar() or 0
+                    _metrics.set_chunk_count(doc.tenant_id, int(total_chunks))
+                except Exception:
+                    pass
+
+                # 写入 document_chunks 表（PostgreSQL 镜像，供 SQL 分析）
+                # uuid5 保证相同 document_id+chunk_index 始终生成同一个 PK，天然幂等
+                if result and result.get("_chunks"):
+                    try:
+                        from sqlalchemy.dialects.postgresql import insert as pg_insert
+                        doc_uuid = uuid.UUID(doc_id)
+                        def _strip_null(s):
+                            """PostgreSQL UTF-8 不允许 \x00 空字节，PDF 解析偶尔会引入，统一过滤。"""
+                            return s.replace("\x00", "") if isinstance(s, str) else s
+
+                        chunk_rows = [
+                            {
+                                "id": str(uuid.uuid5(doc_uuid, str(c["chunk_index"]))),
+                                "document_id": doc_id,
+                                "tenant_id": doc.tenant_id,
+                                "chunk_index": c["chunk_index"],
+                                "content": _strip_null(c["content"]),
+                                "section_path": _strip_null(c.get("section_path")),
+                                "page_num": c.get("page_num"),
+                                "chunk_type": c.get("chunk_type"),
+                                "token_count": c.get("token_count"),
+                                "milvus_id": f"{doc_id}_{c['chunk_index']}",
+                                "chunk_metadata": None,
+                            }
+                            for c in result["_chunks"]
+                        ]
+                        stmt = pg_insert(DocumentChunk).values(chunk_rows).on_conflict_do_nothing(
+                            index_elements=["id"]
+                        )
+                        await session.execute(stmt)
+                        await session.commit()
+                        logger.info(
+                            f"[chunks] 写入 document_chunks 成功: doc={doc_id} count={len(chunk_rows)}"
+                        )
+                    except Exception as e:
+                        logger.warning(f"[chunks] document_chunks 写入失败 doc={doc_id}: {e}")
+
 
 async def _run_ingestion(
     file_path: str,
     tenant_id: str,
     document_id: str,
+    batch_id: str = None,
 ):
     """
     后台任务：执行文档入库（解析→分块→向量化→存储）
@@ -218,6 +335,13 @@ async def _run_ingestion(
     """
     import asyncio
     loop = asyncio.get_event_loop()
+
+    # 批次已被取消（同批其他文件先失败），直接标记失败跳过处理
+    if batch_id and batch_id in _batch_cancelled:
+        await _update_doc_status(document_id, DocumentStatus.FAILED,
+                                  error="同批次其他文件解析失败，已终止")
+        logger.info(f"[batch] 跳过已取消批次内的文件 doc={document_id} batch={batch_id}")
+        return
 
     try:
         result = await loop.run_in_executor(
@@ -233,6 +357,9 @@ async def _run_ingestion(
         await _update_doc_status(document_id, DocumentStatus.FAILED, error=str(e))
         metrics.record_ingest(tenant_id, "failed")
         logger.error(f"Background ingest failed: {document_id} - {e}")
+        # 触发批次级联取消：将同批其他仍在 PROCESSING 的文件全部标为 FAILED
+        if batch_id:
+            await _cancel_batch(batch_id, document_id, str(e))
 
 
 async def _ingest_one(
@@ -240,6 +367,7 @@ async def _ingest_one(
     tenant_id: str,
     background_tasks: BackgroundTasks,
     db: AsyncSession,
+    batch_id: str = None,
 ) -> Document:
     """单文件保存 + 建库记录 + 注册后台入库任务，供单传和批量接口共用。"""
     ext = Path(file.filename).suffix.lower()  # 提取小写扩展名
@@ -265,7 +393,7 @@ async def _ingest_one(
     db.add(doc)
     await db.flush()  # flush 让 doc.id 可用，但事务尚未提交
 
-    background_tasks.add_task(_run_ingestion, file_path, tenant_id, doc.id)  # 注册后台入库任务
+    background_tasks.add_task(_run_ingestion, file_path, tenant_id, doc.id, batch_id)
     return doc
 
 
@@ -273,7 +401,7 @@ async def _ingest_one(
 async def upload_document(
     background_tasks: BackgroundTasks,              # FastAPI 后台任务队列
     file: UploadFile = File(...),                   # 单文件上传，Swagger 可直接测试
-    current_user: TokenData = Depends(get_current_user),
+    current_user: TokenData = Depends(get_tenant_admin_or_above),
     db: AsyncSession = Depends(get_db),
 ):
     """
@@ -286,23 +414,27 @@ async def upload_document(
     if not rate_limiter.check_doc_quota(current_user.tenant_id, current_count):
         raise HTTPException(status_code=429, detail="文档配额已满")
 
-    logger.info(f"[upload] 单文件上传 tenant={current_user.tenant_id} file={file.filename}")  # 入口日志
-    doc = await _ingest_one(file, current_user.tenant_id, background_tasks, db)
-    return doc
+    batch_id = str(uuid.uuid4())
+    logger.info(f"[upload] 单文件上传 tenant={current_user.tenant_id} file={file.filename} batch={batch_id}")
+    doc = await _ingest_one(file, current_user.tenant_id, background_tasks, db, batch_id)
+    with _batch_lock:
+        _batch_registry[batch_id] = [doc.id]
+    # DocumentResponse 的 batch_id 字段来自 Schema 而非 ORM，需手动注入
+    return DocumentResponse.model_validate(doc).model_copy(update={"batch_id": batch_id})
 
 
-@docs_router.post("/upload/batch", response_model=list[DocumentResponse], status_code=202)
+@docs_router.post("/upload/batch", response_model=BatchUploadResponse, status_code=202)
 async def upload_documents_batch(
     background_tasks: BackgroundTasks,              # FastAPI 后台任务队列
     files: list[UploadFile] = File(...),            # 多文件，前端 form-data 用同名字段 files
-    current_user: TokenData = Depends(get_current_user),
+    current_user: TokenData = Depends(get_tenant_admin_or_above),
     db: AsyncSession = Depends(get_db),
 ):
     """
     批量文档上传接口（异步入库）
     POST /api/v1/documents/upload/batch
     所有文件整体校验通过后才入库，有一个不合法则全部拒绝
-    每个文件独立注册后台任务，并发入库互不阻塞
+    每个文件独立注册后台任务；任意一个文件解析失败会终止整批，其余文件标记为 FAILED
 
     curl 示例：
         curl -X POST .../upload/batch \\
@@ -329,18 +461,30 @@ async def upload_documents_batch(
                 detail=f"文件 {f.filename!r} 类型不支持: {ext}。支持: {', '.join(ALLOWED_EXTENSIONS)}"
             )
 
-    logger.info(  # 批量上传入口日志
+    batch_id = str(uuid.uuid4())
+    logger.info(
         f"[upload_batch] tenant={current_user.tenant_id} "
-        f"count={len(files)} files={[f.filename for f in files]}"
+        f"count={len(files)} files={[f.filename for f in files]} batch={batch_id}"
     )
 
     docs = []
     for file in files:
-        doc = await _ingest_one(file, current_user.tenant_id, background_tasks, db)  # 复用单文件逻辑
+        doc = await _ingest_one(file, current_user.tenant_id, background_tasks, db, batch_id)
         docs.append(doc)
 
-    logger.info(f"[upload_batch] 登记完成 ids={[d.id for d in docs]}")  # 全部写入事务
-    return docs
+    # 批次注册：需在后台任务运行（响应发送后）之前完成
+    with _batch_lock:
+        _batch_registry[batch_id] = [d.id for d in docs]
+
+    logger.info(f"[upload_batch] 登记完成 batch={batch_id} ids={[d.id for d in docs]}")
+    return BatchUploadResponse(
+        batch_id=batch_id,
+        total=len(docs),
+        documents=[
+            DocumentResponse.model_validate(d).model_copy(update={"batch_id": batch_id})
+            for d in docs
+        ],
+    )
 
 
 async def _ingest_from_path(
@@ -348,6 +492,7 @@ async def _ingest_from_path(
     tenant_id: str,
     background_tasks: BackgroundTasks,
     db: AsyncSession,
+    batch_id: str = None,
 ) -> Document:
     """从服务器本地路径创建入库记录（文件夹批量入库专用，文件不复制，原路径直接入库）。"""
     file_size = os.path.getsize(file_path)  # 获取文件大小
@@ -366,15 +511,15 @@ async def _ingest_from_path(
     db.add(doc)
     await db.flush()  # 让 doc.id 可用，事务尚未提交
 
-    background_tasks.add_task(_run_ingestion, str(file_path), tenant_id, doc.id)  # 注册后台任务
+    background_tasks.add_task(_run_ingestion, str(file_path), tenant_id, doc.id, batch_id)
     return doc
 
 
-@docs_router.post("/upload/folder", response_model=list[DocumentResponse], status_code=202)
+@docs_router.post("/upload/folder", response_model=BatchUploadResponse, status_code=202)
 async def upload_folder(
     background_tasks: BackgroundTasks,
     request: FolderUploadRequest,          # JSON body：{"folder_path": "...", "recursive": false}
-    current_user: TokenData = Depends(get_current_user),
+    current_user: TokenData = Depends(get_tenant_admin_or_above),
     db: AsyncSession = Depends(get_db),
 ):
     """
@@ -383,6 +528,7 @@ async def upload_folder(
     传入服务器上已存在的文件夹路径，自动扫描所有支持格式的文件并异步入库。
     文件不会被复制，Document.file_path 直接指向原始路径。
     recursive=true 时递归扫描所有子目录。
+    任意一个文件解析失败会终止整批，其余文件标记为 FAILED。
 
     请求示例：
         {"folder_path": "/data/bills/2024", "recursive": true}
@@ -418,21 +564,32 @@ async def upload_folder(
             detail=f"文档配额不足，当前已用 {current_count}，文件夹含 {len(matched)} 个文件，超出限制"
         )
 
-    logger.info(  # 文件夹入库入口日志
+    batch_id = str(uuid.uuid4())
+    logger.info(
         f"[upload_folder] tenant={current_user.tenant_id} "
-        f"folder={request.folder_path} matched={len(matched)} recursive={request.recursive}"
+        f"folder={request.folder_path} matched={len(matched)} recursive={request.recursive} batch={batch_id}"
     )
 
     docs = []
     for file_path in matched:
-        doc = await _ingest_from_path(file_path, current_user.tenant_id, background_tasks, db)
+        doc = await _ingest_from_path(file_path, current_user.tenant_id, background_tasks, db, batch_id)
         docs.append(doc)
 
-    logger.info(  # 登记完成日志
-        f"[upload_folder] 登记完成 count={len(docs)} "
+    with _batch_lock:
+        _batch_registry[batch_id] = [d.id for d in docs]
+
+    logger.info(
+        f"[upload_folder] 登记完成 batch={batch_id} count={len(docs)} "
         f"ids={[d.id for d in docs]}"
     )
-    return docs
+    return BatchUploadResponse(
+        batch_id=batch_id,
+        total=len(docs),
+        documents=[
+            DocumentResponse.model_validate(d).model_copy(update={"batch_id": batch_id})
+            for d in docs
+        ],
+    )
 
 
 @docs_router.get("/", response_model=PaginatedResponse)
@@ -444,34 +601,195 @@ async def list_documents(
     db: AsyncSession = Depends(get_db),
 ):
     """
-    获取当前租户的文档列表（支持分页和状态过滤）
+    获取文档列表（支持分页和状态过滤）
+    - 管理员：可查看所有租户的文档
+    - 普通用户：只能查看本租户的文档
     GET /api/v1/documents/?page=1&page_size=20&status_filter=completed
     """
-    # 构建基础查询（只查当前租户的文档）
-    query = select(Document).where(Document.tenant_id == current_user.tenant_id)
+    # super_admin 查全部；tenant_admin 和 user 只查自己租户
+    base_filter = [] if current_user.is_super_admin else [Document.tenant_id == current_user.tenant_id]
 
-    # 如果有状态过滤，添加过滤条件
+    # 构建主查询
+    query = select(Document)
+    if base_filter:
+        query = query.where(*base_filter)
     if status_filter:
         query = query.where(Document.status == status_filter)
 
-    # 查询总记录数（用于计算总页数）
-    count_q = select(func.count()).select_from(
-        select(Document).where(Document.tenant_id == current_user.tenant_id).subquery()
-        # subquery()：把查询作为子查询，再在外层做 COUNT
-    )
-    total = (await db.execute(count_q)).scalar()  # scalar()：取查询结果的第一个值
+    # 用相同条件查总数（与主查询保持一致，包含 status_filter）
+    count_base = select(Document)
+    if base_filter:
+        count_base = count_base.where(*base_filter)
+    if status_filter:
+        count_base = count_base.where(Document.status == status_filter)
+    count_q = select(func.count()).select_from(count_base.subquery())
+    total = (await db.execute(count_q)).scalar()
 
-    # 分页查询（按上传时间倒序，最新的在前面）
+    # 分页：按上传时间倒序
     query = query.order_by(Document.created_at.desc()).offset((page - 1) * page_size).limit(page_size)
-    # offset：跳过前 N 条（如第2页跳过前20条）；limit：最多返回 N 条
-    docs = (await db.execute(query)).scalars().all()   # all()：取所有结果
+    docs = (await db.execute(query)).scalars().all()
 
     return PaginatedResponse(
-        items=[DocumentResponse.model_validate(d) for d in docs],  # 转换为 Schema 对象
+        items=[DocumentResponse.model_validate(d) for d in docs],
         total=total,
         page=page,
         page_size=page_size,
-        total_pages=(total + page_size - 1) // page_size,  # 向上取整：ceil(total/page_size)
+        total_pages=max(1, (total + page_size - 1) // page_size),
+    )
+
+
+@docs_router.get("/stats")
+async def document_stats(
+    current_user: TokenData = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    获取文档统计数据（分块数、今日查询数）
+    GET /api/v1/documents/stats
+    """
+    from datetime import date as _date
+
+    tenant_filter = [] if current_user.is_super_admin else [Document.tenant_id == current_user.tenant_id]
+
+    chunk_q = select(func.coalesce(func.sum(Document.chunk_count), 0))
+    if tenant_filter:
+        chunk_q = chunk_q.where(*tenant_filter)
+    total_chunks = (await db.execute(chunk_q)).scalar()
+
+    today_q = select(func.count(QueryLog.id)).where(
+        func.date(QueryLog.created_at) == _date.today()
+    )
+    if not current_user.is_super_admin:
+        today_q = today_q.where(QueryLog.tenant_id == current_user.tenant_id)
+    today_queries = (await db.execute(today_q)).scalar()
+
+    return {"total_chunks": int(total_chunks), "today_queries": int(today_queries)}
+
+
+@docs_router.get("/batch/{batch_id}", summary="查询批次内所有文件的处理状态")
+async def get_batch_status(
+    batch_id: str,
+    current_user: TokenData = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    轮询批次处理进度
+    GET /api/v1/documents/batch/{batch_id}
+    返回 overall_status: processing / completed / failed
+    前端可每隔 2-3 秒轮询，直到 overall_status 不再是 processing
+    """
+    with _batch_lock:
+        doc_ids = _batch_registry.get(batch_id)
+        is_cancelled = batch_id in _batch_cancelled
+
+    if doc_ids is None:
+        raise HTTPException(status_code=404, detail="批次不存在或已过期（服务重启后内存清零）")
+
+    # 查询数据库中该批次所有文档的当前状态
+    stmt = select(Document).where(Document.id.in_(doc_ids))
+    if not current_user.is_super_admin:
+        stmt = stmt.where(Document.tenant_id == current_user.tenant_id)
+    docs = (await db.execute(stmt)).scalars().all()
+
+    doc_map = {d.id: d for d in docs}
+    items = []
+    for doc_id in doc_ids:
+        doc = doc_map.get(doc_id)
+        if doc:
+            items.append(BatchDocItem(
+                id=doc.id,
+                filename=doc.filename,
+                status=doc.status.value if hasattr(doc.status, "value") else str(doc.status),
+                error_msg=doc.error_msg,
+                chunk_count=doc.chunk_count or 0,
+            ))
+
+    statuses = {item.status for item in items}
+    if "failed" in statuses:
+        overall = "failed"
+    elif "processing" in statuses or "pending" in statuses:
+        overall = "processing"
+    else:
+        overall = "completed"
+
+    return {
+        "batch_id":       batch_id,
+        "total":          len(items),
+        "overall_status": overall,
+        "is_cancelled":   is_cancelled,
+        "documents":      [item.model_dump() for item in items],
+    }
+
+
+@docs_router.post("/batch/{batch_id}/retry", response_model=BatchUploadResponse, status_code=202,
+                  summary="重试批次内所有失败文件")
+async def retry_batch(
+    batch_id: str,
+    background_tasks: BackgroundTasks,
+    current_user: TokenData = Depends(get_tenant_admin_or_above),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    批次整体重试：将批次内所有 FAILED 文件重置为 PROCESSING 并重新触发入库任务
+    POST /api/v1/documents/batch/{batch_id}/retry
+
+    - 生成全新的 batch_id，避免触发旧批次的取消标记
+    - 已成功（COMPLETED）的文件跳过，不重复处理
+    - 原始文件必须仍在磁盘上，否则该文件跳过并保持 FAILED
+    """
+    with _batch_lock:
+        doc_ids = _batch_registry.get(batch_id)
+
+    if doc_ids is None:
+        raise HTTPException(status_code=404, detail="批次不存在或已过期（服务重启后内存清零）")
+
+    stmt = select(Document).where(Document.id.in_(doc_ids))
+    if not current_user.is_super_admin:
+        stmt = stmt.where(Document.tenant_id == current_user.tenant_id)
+    docs = (await db.execute(stmt)).scalars().all()
+
+    failed_docs = [d for d in docs if d.status == DocumentStatus.FAILED]
+    if not failed_docs:
+        raise HTTPException(status_code=409, detail="批次内没有失败的文件，无需重试")
+
+    # 校验磁盘文件：原始文件不在就无法重试
+    retryable = []
+    skipped = []
+    for doc in failed_docs:
+        if doc.file_path and os.path.exists(doc.file_path):
+            retryable.append(doc)
+        else:
+            skipped.append(doc.filename)
+
+    if skipped:
+        logger.warning(f"[batch_retry] 以下文件原始文件已不存在，跳过: {skipped}")
+
+    if not retryable:
+        raise HTTPException(status_code=422, detail=f"所有失败文件的原始文件均已不存在，请重新上传。文件: {skipped}")
+
+    # 生成新批次 ID，旧批次的取消标记不影响新任务
+    new_batch_id = str(uuid.uuid4())
+
+    for doc in retryable:
+        doc.status = DocumentStatus.PROCESSING
+        doc.error_msg = None
+        background_tasks.add_task(_run_ingestion, doc.file_path, doc.tenant_id, doc.id, new_batch_id)
+
+    with _batch_lock:
+        _batch_registry[new_batch_id] = [d.id for d in retryable]
+
+    logger.info(
+        f"[batch_retry] 旧批次={batch_id} 新批次={new_batch_id} "
+        f"重试={len(retryable)} 跳过={len(skipped)}"
+    )
+
+    return BatchUploadResponse(
+        batch_id=new_batch_id,
+        total=len(retryable),
+        documents=[
+            DocumentResponse.model_validate(d).model_copy(update={"batch_id": new_batch_id})
+            for d in retryable
+        ],
     )
 
 
@@ -485,10 +803,10 @@ async def get_document(
     获取单个文档详情
     GET /api/v1/documents/{document_id}
     """
-    doc = await db.get(Document, document_id)   # 按主键查询（最高效）
+    doc = await db.get(Document, document_id)
 
-    # 文档不存在 或 不属于当前租户（防止A租户查B租户的文档）
-    if not doc or doc.tenant_id != current_user.tenant_id:
+    # super_admin 可查任意租户文档；其他用户只能查自己租户的文档
+    if not doc or (not current_user.is_super_admin and doc.tenant_id != current_user.tenant_id):
         raise HTTPException(status_code=404, detail="文档不存在")
 
     return doc
@@ -498,7 +816,7 @@ async def get_document(
 async def retry_document(
     document_id: str,
     background_tasks: BackgroundTasks,
-    current_user: TokenData = Depends(get_current_user),
+    current_user: TokenData = Depends(get_tenant_admin_or_above),
     db: AsyncSession = Depends(get_db),
 ):
     """
@@ -510,8 +828,8 @@ async def retry_document(
     """
     doc = await db.get(Document, document_id)
 
-    # 文档不存在或不属于当前租户
-    if not doc or doc.tenant_id != current_user.tenant_id:
+    # super_admin 可操作任意租户文档；其他用户只能操作自己租户的文档
+    if not doc or (not current_user.is_super_admin and doc.tenant_id != current_user.tenant_id):
         raise HTTPException(status_code=404, detail="文档不存在")
 
     # 只允许重试失败的文档，避免对正在处理或已完成的文档重复触发
@@ -538,7 +856,7 @@ async def retry_document(
 @docs_router.delete("/{document_id}", response_model=SuccessResponse)
 async def delete_document(
     document_id: str,
-    current_user: TokenData = Depends(get_current_user),
+    current_user: TokenData = Depends(get_tenant_admin_or_above),
     db: AsyncSession = Depends(get_db),
 ):
     """
@@ -546,7 +864,9 @@ async def delete_document(
     DELETE /api/v1/documents/{document_id}
     """
     doc = await db.get(Document, document_id)
-    if not doc or doc.tenant_id != current_user.tenant_id:
+
+    # super_admin 可删除任意租户文档；其他用户只能删除自己租户的文档
+    if not doc or (not current_user.is_super_admin and doc.tenant_id != current_user.tenant_id):
         raise HTTPException(status_code=404, detail="文档不存在")
 
     # 第一步：从 Milvus 删除该文档的所有向量
@@ -556,7 +876,11 @@ async def delete_document(
     if doc.file_path and os.path.exists(doc.file_path):
         os.remove(doc.file_path)   # 删除原始文件
 
-    # 第三步：从数据库删除文档记录（关联的 chunks 记录由数据库外键级联删除）
+    # 第三步：先删除 document_chunks（FK NOT NULL，无级联删除配置，需显式清理）
+    from sqlalchemy import delete as sa_delete
+    await db.execute(sa_delete(DocumentChunk).where(DocumentChunk.document_id == document_id))
+
+    # 第四步：从数据库删除文档记录
     await db.delete(doc)
 
     return SuccessResponse(message=f"文档 {document_id} 已删除")
@@ -602,19 +926,21 @@ async def query(
             top_k=request.top_k,   # 可选：覆盖默认检索数量
         )
 
-        # 记录本次查询到数据库（用于分析和反馈）
-        log = QueryLog(
-            id=result["query_id"],
-            tenant_id=current_user.tenant_id,
-            user_id=current_user.user_id,
-            query=request.query,
-            answer=result["answer"],
-            retrieved_chunks=result["sources"],   # 引用的文档片段（JSON 格式存储）
-            retrieval_ms=result["retrieval_ms"],
-            llm_ms=result["llm_ms"],
-            total_ms=result["total_ms"],
-        )
-        db.add(log)   # 添加到数据库（自动提交）
+        # 问候语响应不写日志（retrieved_count=0 代表早返回，未经过检索）
+        if result.get("retrieved_count", 0) > 0:
+            log = QueryLog(
+                id=result["query_id"],
+                tenant_id=current_user.tenant_id,
+                user_id=current_user.user_id,
+                query=request.query,
+                answer=result["answer"],
+                retrieved_chunks=result["sources"],
+                retrieval_ms=result["retrieval_ms"],
+                llm_ms=result["llm_ms"],
+                total_ms=result["total_ms"],
+                route_type=result.get("route_type"),
+            )
+            db.add(log)
 
         logger.info(  # 问答成功日志，记录耗时和检索数量
             f"[query] 问答完成 tenant={current_user.tenant_id} "
@@ -665,6 +991,7 @@ async def query_stream(
             async for token in rag_service.query_stream(
                 tenant_id=current_user.tenant_id,
                 query=request.query,
+                user_id=current_user.user_id,
             ):
                 token_count += 1  # 每个 token 计数
                 yield f"data: {token}\n\n"  # SSE 格式：每条数据以 "data: " 开头，\n\n 结尾
@@ -691,6 +1018,117 @@ async def query_stream(
             "X-Accel-Buffering": "no",         # 禁止 nginx 对 SSE 做响应缓冲
         },
     )
+
+
+@query_router.get("/stats")
+async def query_stats(
+    current_user: TokenData = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    检索统计：专项/模糊 × 成功/失败 四维度 + 耗时 + 近期日志
+    GET /api/v1/query/stats
+    """
+    from datetime import date as _date
+
+    tenant_filter = [] if current_user.is_super_admin else [QueryLog.tenant_id == current_user.tenant_id]
+
+    def _apply(q):
+        return q.where(*tenant_filter) if tenant_filter else q
+
+    # ── 核心四维度：route_type × top_k_hit ────────────────────────────────
+    matrix_q = _apply(
+        select(
+            QueryLog.route_type,
+            QueryLog.top_k_hit,
+            func.count(QueryLog.id).label("cnt"),
+        ).group_by(QueryLog.route_type, QueryLog.top_k_hit)
+    )
+    matrix_rows = (await db.execute(matrix_q)).fetchall()
+
+    # 初始化各维度计数
+    counts = {
+        "specialized_success": 0,
+        "specialized_fail":    0,
+        "fuzzy_success":       0,
+        "fuzzy_fail":          0,
+        "off_topic":           0,  # 无关咨询（未经检索，直接拒绝）
+        "unknown":             0,  # top_k_hit=NULL（历史数据兜底）
+    }
+    for row in matrix_rows:
+        rt  = row.route_type or "fuzzy"
+        hit = row.top_k_hit
+        if rt == "off_topic":
+            counts["off_topic"] += row.cnt
+        elif rt == "specialized":
+            if hit is True:  counts["specialized_success"] += row.cnt
+            elif hit is False: counts["specialized_fail"]  += row.cnt
+            else:              counts["unknown"]            += row.cnt
+        else:  # fuzzy
+            if hit is True:  counts["fuzzy_success"] += row.cnt
+            elif hit is False: counts["fuzzy_fail"]  += row.cnt
+            else:              counts["unknown"]      += row.cnt
+
+    total       = sum(counts.values())
+    specialized = counts["specialized_success"] + counts["specialized_fail"]
+    fuzzy       = counts["fuzzy_success"]       + counts["fuzzy_fail"]
+    success     = counts["specialized_success"] + counts["fuzzy_success"]
+    fail        = counts["specialized_fail"]    + counts["fuzzy_fail"]
+    off_topic   = counts["off_topic"]
+
+    # ── 今日查询数 ─────────────────────────────────────────────────────────
+    today_q = _apply(
+        select(func.count(QueryLog.id)).where(
+            func.date(QueryLog.created_at) == _date.today()
+        )
+    )
+    today = (await db.execute(today_q)).scalar() or 0
+
+    # ── 平均耗时（仅检索成功的条目）──────────────────────────────────────
+    avg_q = _apply(
+        select(
+            func.round(func.avg(QueryLog.retrieval_ms).cast(Numeric), 1).label("avg_retrieval"),
+            func.round(func.avg(QueryLog.total_ms).cast(Numeric), 1).label("avg_total"),
+        ).where(QueryLog.top_k_hit.is_(True))
+    )
+    avg_row = (await db.execute(avg_q)).fetchone()
+
+    # ── 最近 50 条查询日志 ─────────────────────────────────────────────────
+    recent_q = _apply(
+        select(QueryLog).order_by(QueryLog.created_at.desc()).limit(50)
+    )
+    recent_logs = (await db.execute(recent_q)).scalars().all()
+
+    def _log_dict(log):
+        return {
+            "id":             log.id,
+            "query":          log.query,
+            "route_type":     log.route_type,
+            "intent_id":      log.intent_id,
+            "top_k_hit":      log.top_k_hit,
+            "retrieval_ms":   log.retrieval_ms,
+            "total_ms":       log.total_ms,
+            "chunk_count":    len(log.retrieved_chunks) if log.retrieved_chunks else 0,
+            "feedback_score": log.feedback_score,
+            "created_at":     log.created_at.isoformat() if log.created_at else None,
+        }
+
+    return {
+        "total":                total,
+        "specialized":          specialized,
+        "fuzzy":                fuzzy,
+        "success":              success,
+        "fail":                 fail,
+        "off_topic":            off_topic,
+        "specialized_success":  counts["specialized_success"],
+        "specialized_fail":     counts["specialized_fail"],
+        "fuzzy_success":        counts["fuzzy_success"],
+        "fuzzy_fail":           counts["fuzzy_fail"],
+        "today":                today,
+        "avg_retrieval_ms":     float(avg_row.avg_retrieval) if avg_row and avg_row.avg_retrieval else 0,
+        "avg_total_ms":         float(avg_row.avg_total)     if avg_row and avg_row.avg_total     else 0,
+        "recent":               [_log_dict(l) for l in recent_logs],
+    }
 
 
 @query_router.post("/feedback", response_model=SuccessResponse)
@@ -730,36 +1168,80 @@ async def create_tenant(
     POST /api/v1/tenants/
     每个票据机构入驻系统时需要管理员先创建租户
     """
-    # 检查机构代码是否已存在（机构代码全系统唯一）
-    existing = await db.execute(select(Tenant).where(Tenant.code == request.code))
-    if existing.scalar_one_or_none():
-        raise HTTPException(status_code=409, detail="机构代码已存在")
+    # 若填写了统一社会信用代码，先查库是否已有同一家公司
+    if request.license_no:
+        dup = await db.execute(select(Tenant).where(Tenant.license_no == request.license_no))
+        existing_tenant = dup.scalar_one_or_none()
+        if existing_tenant:
+            # 租户已存在，直接返回，前端会用返回的 id 去注册用户
+            return existing_tenant
+
+    # 生成唯一机构代码（未填则取 UUID 前 8 位大写）
+    code = (request.code or uuid.uuid4().hex[:8].upper()).upper()
+    dup_code = await db.execute(select(Tenant).where(Tenant.code == code))
+    if dup_code.scalar_one_or_none():
+        raise HTTPException(status_code=409, detail=f"机构代码 {code!r} 已存在")
 
     tenant = Tenant(
         id=str(uuid.uuid4()),
         name=request.name,
-        code=request.code,
+        code=code,
         license_no=request.license_no,
         doc_quota=request.doc_quota,
         qps_limit=request.qps_limit,
-        milvus_partition=f"tenant_{request.code}",  # 自动生成 Milvus 分区名（如 tenant_ABC_BANK）
+        milvus_partition=f"tenant_{code}",
     )
     db.add(tenant)
+    await db.flush()           # 触发 INSERT，让数据库填充 server_default 字段
+    await db.refresh(tenant)   # 重新加载，使 status/created_at 等字段有值
     return tenant
 
 
 @tenant_router.get("/", response_model=list[TenantResponse])
 async def list_tenants(
-    _: TokenData = Depends(get_admin_user),   # 仅管理员
+    current_user: TokenData = Depends(get_tenant_admin_or_above),
     db: AsyncSession = Depends(get_db),
 ):
     """
-    获取所有租户列表（仅管理员）
+    获取租户列表
     GET /api/v1/tenants/
+    - super_admin：返回全部租户
+    - tenant_admin：仅返回自己所属租户
     """
-    result = await db.execute(select(Tenant).order_by(Tenant.created_at.desc()))
-    # 按创建时间倒序，最新注册的租户排在前面
-    return result.scalars().all()   # 返回所有租户对象
+    if current_user.is_super_admin:
+        result = await db.execute(select(Tenant).order_by(Tenant.created_at.desc()))
+        tenants = result.scalars().all()
+    else:
+        tenant = await db.get(Tenant, current_user.tenant_id)
+        tenants = [tenant] if tenant else []
+
+    if not tenants:
+        return []
+
+    # 批量查询各租户文档数和查询数，附加到响应
+    tenant_ids = [t.id for t in tenants]
+    doc_counts = dict(
+        (await db.execute(
+            select(Document.tenant_id, func.count(Document.id).label("cnt"))
+            .where(Document.tenant_id.in_(tenant_ids))
+            .group_by(Document.tenant_id)
+        )).fetchall()
+    )
+    query_counts = dict(
+        (await db.execute(
+            select(QueryLog.tenant_id, func.count(QueryLog.id).label("cnt"))
+            .where(QueryLog.tenant_id.in_(tenant_ids))
+            .group_by(QueryLog.tenant_id)
+        )).fetchall()
+    )
+
+    result_list = []
+    for t in tenants:
+        data = TenantResponse.model_validate(t)
+        data.doc_count = doc_counts.get(t.id, 0)
+        data.query_count = query_counts.get(t.id, 0)
+        result_list.append(data)
+    return result_list
 
 
 @tenant_router.get("/{tenant_id}/stats", response_model=TenantStats)
@@ -773,43 +1255,66 @@ async def get_tenant_stats(
     GET /api/v1/tenants/{tenant_id}/stats
     权限：管理员可查看任意租户，普通用户只能查看自己的租户
     """
-    # 权限检查：非管理员只能查看自己的租户
-    if not current_user.is_admin and current_user.tenant_id != tenant_id:
-        raise HTTPException(status_code=403, detail="无权访问")
+    # 权限检查：super_admin 可查任意租户；tenant_admin 只能查自己的租户；普通用户拒绝
+    if not current_user.is_tenant_admin_or_above:
+        raise HTTPException(status_code=403, detail="需要管理员权限")
+    if not current_user.is_super_admin and current_user.tenant_id != tenant_id:
+        raise HTTPException(status_code=403, detail="无权访问其他租户数据")
 
     tenant = await db.get(Tenant, tenant_id)
     if not tenant:
         raise HTTPException(status_code=404, detail="租户不存在")
 
-    # 从 Redis 读取文档计数（比查数据库快）
-    doc_count = rate_limiter.get_doc_count(tenant_id)
+    # 文档统计（直接查库，避免 Redis 计数不一致）
+    doc_rows = (await db.execute(
+        select(Document.status, func.count(Document.id).label("cnt"))
+        .where(Document.tenant_id == tenant_id)
+        .group_by(Document.status)
+    )).fetchall()
+    doc_count = sum(r.cnt for r in doc_rows)
+    completed_count = next((r.cnt for r in doc_rows if str(r.status) in ("completed", "DocumentStatus.COMPLETED")), 0)
+    failed_count    = next((r.cnt for r in doc_rows if str(r.status) in ("failed",    "DocumentStatus.FAILED")),    0)
 
-    # 查询该租户所有文档的 chunk 总数
-    chunk_count_q = await db.execute(
-        select(func.sum(Document.chunk_count)).where(Document.tenant_id == tenant_id)
-        # func.sum：SQL 的 SUM 函数，统计所有文档的 chunk_count 之和
-    )
-    chunk_count = chunk_count_q.scalar() or 0   # 如果没有文档，SUM 返回 None，用 or 0 转为 0
+    # 分块总数
+    chunk_count = (await db.execute(
+        select(func.coalesce(func.sum(Document.chunk_count), 0))
+        .where(Document.tenant_id == tenant_id)
+    )).scalar() or 0
 
-    # 查询今天的查询次数
-    today_query_q = await db.execute(
+    # 查询统计
+    query_count = (await db.execute(
+        select(func.count(QueryLog.id)).where(QueryLog.tenant_id == tenant_id)
+    )).scalar() or 0
+
+    today_query_count = (await db.execute(
         select(func.count(QueryLog.id)).where(
             QueryLog.tenant_id == tenant_id,
             func.date(QueryLog.created_at) == func.current_date()
-            # func.date()：提取日期部分；func.current_date()：今天的日期
         )
-    )
-    today_queries = today_query_q.scalar() or 0
+    )).scalar() or 0
+
+    # 平均响应耗时（仅成功检索的请求）
+    avg_raw = (await db.execute(
+        select(func.avg(QueryLog.total_ms))
+        .where(QueryLog.tenant_id == tenant_id)
+        .where(QueryLog.total_ms.isnot(None))
+    )).scalar()
+    avg_latency_ms = round(float(avg_raw), 1) if avg_raw else None
+
+    quota_pct = round(doc_count / tenant.doc_quota * 100, 1) if tenant.doc_quota else 0.0
 
     return TenantStats(
         tenant_id=tenant_id,
         doc_count=doc_count,
+        completed_count=completed_count,
+        failed_count=failed_count,
         chunk_count=chunk_count,
-        query_count_today=today_queries,
+        query_count=query_count,
+        today_query_count=today_query_count,
         doc_quota=tenant.doc_quota,
         qps_limit=tenant.qps_limit,
-        quota_used_pct=round(doc_count / tenant.doc_quota * 100, 1),
-        # 配额使用百分比，保留1位小数（如 45.3）
+        quota_used_pct=quota_pct,
+        avg_latency_ms=avg_latency_ms,
     )
 
 
@@ -1106,6 +1611,266 @@ async def get_bill(
     )
 
 
+# ── 票据咨询接口（聊天窗口发起业务前的可行性审核）───────────────────────────────────
+@query_router.post(
+    "/consult",
+    response_model=None,      # 动态响应类型（rag_answer / agent_report），此处不限定 Schema
+    summary="票据业务咨询（上传票据 + 意图路由）",
+    description=(
+        "聊天窗口一站式咨询接口，业务员在发起业务流程前调用。\n\n"
+        "**使用方式（multipart/form-data）：**\n"
+        "- `query`：自然语言问题（必填），如：这张票据能否贴现\n"
+        "- `bill_file`：票据图片/PDF（可选），上传后自动识别要素\n"
+        "- `bill_record_id`：已入库的票据主档 ID（可替代文件上传）\n\n"
+        "**响应类型（response_type）：**\n"
+        "- `rag_answer`：知识性问题，返回 RAG 检索答案\n"
+        "- `agent_report`：票据审核类问题，返回结构化审核报告\n"
+        "- `off_topic`：与票据业务无关，返回引导语"
+    ),
+)
+async def consult(
+    query: str = Form(..., description="用户问题，如'这张票据能否贴现？'"),
+    bill_file: Optional[UploadFile] = File(default=None, description="票据图片或PDF（可选）"),
+    bill_record_id: Optional[str] = Form(default=None, description="已入库票据主档ID（与文件上传二选一）"),
+    current_user: TokenData = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    票据业务咨询接口（发起业务流程前的可行性报告）
+    POST /api/v1/query/consult
+
+    核心流程：
+    1. 若上传了 bill_file → 调用视觉模型识别票据要素（命中缓存则跳过）
+    2. 意图识别（关键词 → LLM）判断是 RAG知识问答 还是 Agent专项审核
+    3. Agent意图 → 调用 OrchestratorAgent.run_for_chat()，同步等待审核结论
+       RAG意图 → 调用 rag_service.query_v2()，返回知识检索答案
+    4. 统一封装为 ConsultResponse 返回
+    """
+    import time
+    import uuid as _uuid
+    from app.models.schemas import ConsultIssue, ConsultReport, ConsultResponse
+    from app.services.intent_router import intent_router
+
+    # ── 限流检查 ────────────────────────────────────────────────────────────────
+    allowed, rl_info = rate_limiter.check_rate_limit(current_user.tenant_id)
+    if not allowed:
+        metrics.record_rate_limited(current_user.tenant_id)
+        raise HTTPException(
+            status_code=429,
+            detail=f"请求频率超限，请 {rl_info['reset_in']}s 后重试",
+            headers={"X-RateLimit-Reset": str(rl_info["reset_in"])},
+        )
+
+    query_id = _uuid.uuid4().hex[:16]  # 本次请求唯一 ID（用于日志追踪）
+    t_start = time.perf_counter()
+
+    logger.info(
+        f"[consult] 收到咨询请求 tenant={current_user.tenant_id} "
+        f"query_id={query_id} query={query[:60]!r} "
+        f"has_file={bill_file is not None} bill_record_id={bill_record_id}"
+    )
+
+    # ── 步骤 1：票据文件上传 → 要素识别 ─────────────────────────────────────────
+    bill_elements_dict: Optional[dict] = None  # 识别出的票据要素（供后续使用）
+    bill_element_for_rag: Optional[dict] = None  # RAG 路径使用的上下文
+    bill_file_bytes: Optional[bytes] = None
+    bill_filename: str = ""
+
+    if bill_file is not None:
+        # 校验文件类型（仅允许图片和 PDF）
+        suffix = Path(bill_file.filename or "").suffix.lower()
+        if suffix not in BILL_ALLOWED_EXTENSIONS:
+            raise HTTPException(
+                status_code=415,
+                detail=f"不支持的文件类型 '{suffix}'，请上传 PDF 或图片文件",
+            )
+        bill_file_bytes = await bill_file.read()
+        if not bill_file_bytes:
+            raise HTTPException(status_code=400, detail="上传的票据文件内容为空")
+
+        bill_filename = bill_file.filename or ""
+
+        # 调用视觉识别服务（内部已集成 Redis 缓存，同一文件不重复识别）
+        try:
+            from app.services.bill_recognition import bill_recognition_service
+            from dataclasses import asdict
+            recog = bill_recognition_service.recognize_file(bill_file_bytes, bill_filename)
+            if recog.bills:
+                b = recog.bills[0]  # 取第一张票据（主票据）
+                bill_elements_dict = asdict(b)  # 转为 dict，注入 shared_data
+                bill_elements_dict["confidence_score"] = 1.0  # 默认置信度
+                # RAG 路径用的轻量上下文（仅核心字段）
+                bill_element_for_rag = {
+                    "ticket_number":  b.ticket_number,
+                    "ticket_type":    b.ticket_type,
+                    "issue_date":     b.issue_date,
+                    "due_date":       b.due_date,
+                    "amount_numeric": b.amount_numeric,
+                    "amount_text":    b.amount_text,
+                    "drawer":         b.drawer,
+                    "acceptor":       b.acceptor,
+                    "payee":          b.payee,
+                }
+                logger.info(
+                    f"[consult] 票据识别成功 ticket={b.ticket_number} "
+                    f"elapsed={recog.elapsed_ms:.0f}ms"
+                )
+        except Exception as e:
+            logger.warning(f"[consult] 票据识别失败，将仅走RAG路径: {e}")
+            # 识别失败不中断流程，降级为纯 RAG 问答
+
+    elif bill_record_id:
+        # 从数据库加载已入库票据的要素
+        bill_record = await db.get(BillRecord, bill_record_id)
+        if bill_record and bill_record.tenant_id == current_user.tenant_id:
+            bill_element_for_rag = {
+                "ticket_number":  bill_record.ticket_number,
+                "ticket_type":    bill_record.ticket_type,
+                "issue_date":     bill_record.issue_date,
+                "due_date":       bill_record.due_date,
+                "amount_numeric": bill_record.amount_numeric,
+                "amount_text":    bill_record.amount_text,
+                "drawer":         bill_record.drawer,
+                "acceptor":       bill_record.acceptor,
+                "payee":          bill_record.payee,
+            }
+            # 已入库票据，也用于 Agent 路径（但没有完整18字段，用精简版）
+            bill_elements_dict = bill_element_for_rag
+
+    # ── 步骤 2：意图识别 ──────────────────────────────────────────────────────
+    intent_id, confidence, intent_method = await intent_router.classify(query)
+
+    logger.info(
+        f"[consult] 意图识别完成 intent={intent_id} confidence={confidence:.2f} "
+        f"method={intent_method} is_agent={intent_router.is_agent_intent(intent_id)}"
+    )
+
+    # ── 步骤 3a：Agent 审核路径 ───────────────────────────────────────────────
+    # 核心原则：Agent 路由必须同时满足两个条件：
+    #   1. 意图识别为 Agent 类意图
+    #   2. 有票据文件/bill_record_id（有明确的审核对象）
+    # 缺少票据时，即使意图是 Agent 类，也降级为 RAG 知识查询：
+    #   用户可能只是在咨询某类业务的知识，还没准备好上传票据做审核
+    #   此时强制要求上传文件会打断用户的知识咨询流程
+    if intent_router.is_agent_intent(intent_id) and bill_elements_dict:
+        # 有票据 + Agent意图 → 执行专项 Agent 审核
+
+        # 获取对应的 task_type 和报告标签
+        task_type_str = intent_router.get_agent_task_type(intent_id)
+        audit_label   = intent_router.get_agent_label(intent_id)
+
+        # 懒加载 OrchestratorAgent（避免启动时加载所有 Agent，首次调用时从注册表实例化）
+        from app.agents.orchestrator_agent import OrchestratorAgent
+        orchestrator = OrchestratorAgent()  # 无参构造：内部自动从 AgentRegistry 懒加载
+
+        try:
+            # 调用聊天审核模式（同步等待，预填充要素跳过 OCR）
+            report_data = await orchestrator.run_for_chat(
+                task_type_str=task_type_str,
+                tenant_id=current_user.tenant_id,
+                db=db,
+                bill_element_dict=bill_elements_dict,
+                audit_label=audit_label,
+                timeout_seconds=180.0,
+            )
+        except Exception as e:
+            logger.error(f"[consult] Agent 审核失败: {e}")
+            raise HTTPException(status_code=500, detail=f"审核服务暂时不可用: {str(e)}")
+
+        t_elapsed = (time.perf_counter() - t_start) * 1000
+
+        # 构建结构化报告
+        issues = [
+            ConsultIssue(
+                field=i.get("field", "unknown"),
+                level=i.get("level", "warning"),
+                description=i.get("description", ""),
+                recommendation=i.get("recommendation"),
+            )
+            for i in report_data.get("issues", [])
+        ]
+
+        report = ConsultReport(
+            audit_task_type=task_type_str,
+            audit_label=audit_label,
+            conclusion=report_data.get("conclusion", "审核中"),
+            risk_level=report_data.get("risk_level", "UNKNOWN"),
+            overall_score=report_data.get("overall_score"),
+            issues=issues,
+            summary=report_data.get("summary", ""),
+            task_id=report_data.get("task_id", ""),
+            elapsed_ms=report_data.get("elapsed_ms", 0.0),
+        )
+
+        logger.info(
+            f"[consult] Agent审核完成 query_id={query_id} "
+            f"task_id={report_data.get('task_id', '')[:8]} "
+            f"conclusion={report.conclusion} elapsed={t_elapsed:.0f}ms"
+        )
+        metrics.record_query(current_user.tenant_id, "success")
+
+        return ConsultResponse(
+            query_id=query_id,
+            intent_id=intent_id,
+            response_type="agent_report",
+            answer=report.summary,          # 摘要作为主答案，方便前端直接展示
+            report=report,
+            bill_elements=bill_elements_dict,
+            sources=[],
+            retrieval_ms=0.0,
+            llm_ms=report_data.get("elapsed_ms", 0.0),
+            total_ms=t_elapsed,
+        )
+
+    # ── 步骤 3b：离题处理 ────────────────────────────────────────────────────
+    if intent_router.is_off_topic(intent_id, query):
+        t_elapsed = (time.perf_counter() - t_start) * 1000
+        return {
+            "query_id":      query_id,
+            "intent_id":     intent_id,
+            "response_type": "off_topic",
+            "answer":        "抱歉，您的问题超出了票据业务范围。本系统专注于票据合规审核、背书链分析、贴现申请审核等票据相关服务，请提问票据业务相关问题。",
+            "report":        None,
+            "bill_elements": bill_elements_dict,
+            "sources":       [],
+            "retrieval_ms":  0.0,
+            "llm_ms":        0.0,
+            "total_ms":      t_elapsed,
+        }
+
+    # ── 步骤 3c：RAG 知识问答路径 ─────────────────────────────────────────────
+    try:
+        rag_result = await rag_service.query_v2(
+            tenant_id=current_user.tenant_id,
+            query=query,
+            top_k=None,
+            user_id=current_user.user_id,
+            bill_context=bill_element_for_rag,  # 将票据上下文注入检索（若有文件上传）
+            db=db,
+        )
+        metrics.record_query(current_user.tenant_id, "success")
+    except Exception as e:
+        metrics.record_query(current_user.tenant_id, "error")
+        logger.error(f"[consult] RAG 问答失败: {e}")
+        raise HTTPException(status_code=500, detail=f"问答服务失败: {str(e)}")
+
+    t_elapsed = (time.perf_counter() - t_start) * 1000
+    sources = [SourceChunk(**s) for s in rag_result.get("sources", [])]
+
+    return ConsultResponse(
+        query_id=query_id,
+        intent_id=intent_id,
+        response_type="rag_answer",
+        answer=rag_result.get("answer", ""),
+        report=None,
+        bill_elements=bill_elements_dict,
+        sources=sources,
+        retrieval_ms=rag_result.get("retrieval_ms", 0.0),
+        llm_ms=rag_result.get("llm_ms", 0.0),
+        total_ms=t_elapsed,
+    )
+
+
 # ── 增强版问答接口（挂载在 query_router 下）──────────────────────────────────────
 @query_router.post(
     "/v2",
@@ -1218,19 +1983,32 @@ async def prometheus_metrics():
 @metrics_router.get("/health")
 async def health_check():
     """
-    系统健康检查接口
+    系统健康检查接口（增强版）
     GET /health
-    监控系统（如 K8s、负载均衡器）定期调用，返回"healthy"就继续转发流量
-    同时检查依赖服务（Milvus、Redis）的状态
+    K8s / 负载均衡器定期调用，判断是否继续转发流量。
+    检查所有关键依赖：Milvus、Redis、PostgreSQL、MCP Server、LangGraph 检查点。
+    全部正常返回 HTTP 200，任意一个异常返回 HTTP 503。
     """
-    return {
-        "status": "healthy",              # 应用本身正常运行
-        "version": settings.APP_VERSION,  # 当前版本
-        "services": {
-            "milvus": _check_milvus(),    # Milvus 连通性
-            "redis": _check_redis(),      # Redis 连通性
-        }
+    checks = {
+        "milvus":         _check_milvus(),            # 向量数据库连通性
+        "redis":          _check_redis(),             # 缓存服务连通性
+        "postgres":       await _check_postgres(),    # 关系型数据库连通性
+        "mcp_server":     _check_mcp_tools(),         # MCP 工具是否已注册
+        "langgraph":      _check_langgraph(),         # LangGraph 检查点是否已初始化
     }
+
+    # 任意一个依赖不可用则整体标记为 degraded（K8s 可据此决定是否重启）
+    all_ok = all(v == "ok" for v in checks.values())
+    status = "healthy" if all_ok else "degraded"
+
+    return JSONResponse(
+        status_code=200 if all_ok else 503,           # 503 告知负载均衡停止转发
+        content={
+            "status":  status,
+            "version": settings.APP_VERSION,
+            "checks":  checks,
+        }
+    )
 
 
 def _check_milvus() -> str:
@@ -1248,7 +2026,39 @@ def _check_redis() -> str:
     try:
         import redis
         r = redis.from_url(settings.REDIS_URL)
-        r.ping()         # ping：Redis 的心跳命令，返回 PONG 表示正常
+        r.ping()         # ping：Redis 心跳命令，返回 PONG 表示正常
         return "ok"
+    except Exception:
+        return "unavailable"
+
+
+async def _check_postgres() -> str:
+    """检查 PostgreSQL 是否可以连接（异步），返回 "ok" 或 "unavailable" """
+    try:
+        from sqlalchemy import text
+        from app.core.database import engine           # 模块级异步引擎（在 database.py 中创建）
+        async with engine.connect() as conn:
+            await conn.execute(text("SELECT 1"))       # 最轻量的心跳查询
+        return "ok"
+    except Exception:
+        return "unavailable"
+
+
+def _check_mcp_tools() -> str:
+    """检查 MCP Server 是否已注册工具，返回注册数量或 "unavailable" """
+    try:
+        from app.mcp.server import mcp              # 获取全局 FastMCP 实例
+        tool_count = len(list(mcp._tool_manager._tools))  # 读取已注册工具数量
+        return "ok" if tool_count > 0 else "unavailable"
+    except Exception:
+        return "unavailable"
+
+
+def _check_langgraph() -> str:
+    """检查 LangGraph 检查点（PostgresSaver）是否已初始化，返回 "ok" 或 "unavailable" """
+    try:
+        from app.graph import get_checkpointer
+        checkpointer = get_checkpointer()           # 获取全局 PostgresSaver 实例
+        return "ok" if checkpointer is not None else "unavailable"
     except Exception:
         return "unavailable"

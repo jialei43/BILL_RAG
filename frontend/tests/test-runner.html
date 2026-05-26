@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <title>前端单元测试</title>
+  <style>
+    body { font-family: 'Noto Sans SC', monospace; padding: 24px; background: #f8fafc; }
+    h1   { color: #1e40af; margin-bottom: 24px; }
+    .suite { margin-bottom: 24px; background: #fff; border-radius: 8px; padding: 16px; box-shadow: 0 1px 3px rgba(0,0,0,.08); }
+    .suite-name { font-weight: 700; font-size: 16px; margin-bottom: 12px; color: #1e293b; }
+    .case { padding: 6px 0; border-bottom: 1px solid #f1f5f9; display: flex; align-items: center; gap: 8px; font-size: 13px; }
+    .case:last-child { border-bottom: none; }
+    .pass  { color: #059669; }
+    .fail  { color: #dc2626; }
+    .icon  { font-size: 14px; }
+    .summary { font-size: 15px; font-weight: 600; padding: 16px; border-radius: 8px; margin-top: 16px; }
+    .summary.all-pass { background: #d1fae5; color: #065f46; }
+    .summary.has-fail  { background: #fee2e2; color: #7f1d1d; }
+    pre   { font-size: 11px; color: #dc2626; margin-top: 4px; white-space: pre-wrap; word-break: break-all; }
+  </style>
+</head>
+<body>
+<h1>🧪 前端单元测试</h1>
+<div id="results"></div>
+
+<!-- 按顺序加载被测模块 -->
+<script src="../js/config.js"></script>
+<script src="../js/auth.js"></script>
+<script src="../js/utils.js"></script>
+<script src="../js/api.js"></script>
+
+<!-- 测试框架 -->
+<script>
+  /**
+   * 极简浏览器端测试运行器
+   * API:
+   *   TestRunner.suite(name, fn)    — 定义测试套件
+   *   TestRunner.test(name, fn)     — 在套件内定义测试用例
+   *   TestRunner.assert(cond, msg)  — 断言（失败抛出 AssertionError）
+   *   TestRunner.assertEqual(a, b)  — 相等断言
+   *   TestRunner.run()              — 执行所有套件并渲染结果
+   */
+  const TestRunner = (() => {
+    const suites   = [];                    // 所有套件的定义列表
+    let _current   = null;                  // 当前正在注册的套件
+
+    /** 定义测试套件 */
+    function suite(name, fn) {
+      _current = { name, cases: [] };      // 创建新套件
+      suites.push(_current);
+      fn();                                // 执行套件函数，收集 test()
+      _current = null;
+    }
+
+    /** 在当前套件中添加测试用例 */
+    function test(name, fn) {
+      if (!_current) throw new Error('test() 必须在 suite() 内调用');
+      _current.cases.push({ name, fn });
+    }
+
+    /** 断言：条件为 false 时抛出错误 */
+    function assert(condition, msg) {
+      if (!condition) throw new Error(msg || 'Assertion failed');
+    }
+
+    /** 相等断言 */
+    function assertEqual(a, b, msg) {
+      if (a !== b) throw new Error(msg || `Expected ${JSON.stringify(b)}, got ${JSON.stringify(a)}`);
+    }
+
+    /** 不等断言 */
+    function assertNotNull(val, msg) {
+      if (val == null) throw new Error(msg || `Expected non-null, got ${val}`);
+    }
+
+    /** 运行所有测试并渲染结果到页面 */
+    function run() {
+      const container = document.getElementById('results');
+      let totalPass = 0, totalFail = 0;
+
+      suites.forEach(({ name, cases }) => {
+        const suiteEl = document.createElement('div');
+        suiteEl.className = 'suite';
+        suiteEl.innerHTML = `<div class="suite-name">📦 ${name}</div>`;
+
+        cases.forEach(({ name: caseName, fn }) => {
+          const caseEl = document.createElement('div');
+          caseEl.className = 'case';
+          try {
+            fn();                                    // 执行测试函数
+            caseEl.innerHTML = `<span class="icon pass">✓</span><span class="pass">${caseName}</span>`;
+            totalPass++;
+          } catch (e) {
+            caseEl.innerHTML = `
+              <span class="icon fail">✕</span>
+              <div>
+                <span class="fail">${caseName}</span>
+                <pre>${e.message}</pre>
+              </div>
+            `;
+            totalFail++;
+          }
+          suiteEl.appendChild(caseEl);
+        });
+
+        container.appendChild(suiteEl);
+      });
+
+      // 汇总
+      const summary = document.createElement('div');
+      const allPass = totalFail === 0;
+      summary.className = `summary ${allPass ? 'all-pass' : 'has-fail'}`;
+      summary.textContent = allPass
+        ? `✅ 全部通过：${totalPass} / ${totalPass} 个测试`
+        : `❌ ${totalFail} 个失败，${totalPass} 个通过（共 ${totalPass + totalFail}）`;
+      container.appendChild(summary);
+    }
+
+    return { suite, test, assert, assertEqual, assertNotNull, run };
+  })();
+</script>
+
+<!-- 加载测试用例 -->
+<script src="./auth.test.js"></script>
+<script src="./api.test.js"></script>
+<script src="./utils.test.js"></script>
+
+<!-- 执行所有测试 -->
+<script>TestRunner.run();</script>
+</body>
+</html>

@@ -1,0 +1,921 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>管理后台 — 租户管理</title>
+  <style>
+    /* ── 变量（与其他页一致）──────────────────────────────── */
+    :root {
+      --primary:      #1e40af;
+      --primary-light:#3b82f6;
+      --primary-dark: #1e3a8a;
+      --success:      #059669;
+      --warning:      #d97706;
+      --danger:       #dc2626;
+      --sidebar-w:    240px;
+      --topbar-h:     64px;
+      --bg:           #f1f5f9;
+      --card-bg:      #ffffff;
+      --text:         #1e293b;
+      --text-light:   #64748b;
+      --border:       #e2e8f0;
+      --radius:       12px;
+      --shadow:       0 1px 3px rgba(0,0,0,.08), 0 4px 12px rgba(0,0,0,.04);
+    }
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: 'PingFang SC', 'Helvetica Neue', Arial, sans-serif;
+      background: var(--bg); color: var(--text);
+      display: flex; min-height: 100vh;
+    }
+    a { text-decoration: none; color: inherit; }
+    button { cursor: pointer; border: none; outline: none; font-family: inherit; }
+    input, select, textarea { font-family: inherit; outline: none; }
+
+    /* ── 侧边栏 ───────────────────────────────────────────── */
+    .sidebar {
+      width: var(--sidebar-w); background: var(--primary-dark);
+      display: flex; flex-direction: column;
+      position: fixed; top: 0; left: 0; bottom: 0; z-index: 100;
+    }
+    .sidebar-brand {
+      height: var(--topbar-h); display: flex; align-items: center; gap: 10px;
+      padding: 0 20px; border-bottom: 1px solid rgba(255,255,255,.1);
+    }
+    .brand-icon {
+      width: 36px; height: 36px; background: var(--primary-light);
+      border-radius: 8px; display: flex; align-items: center; justify-content: center;
+      font-size: 20px; flex-shrink: 0;
+    }
+    .brand-text { color: #fff; font-size: 15px; font-weight: 700; line-height: 1.2; }
+    .brand-sub  { color: rgba(255,255,255,.5); font-size: 11px; }
+    .sidebar-nav { flex: 1; padding: 16px 0; overflow-y: auto; }
+    .nav-section-title {
+      color: rgba(255,255,255,.35); font-size: 11px; font-weight: 600;
+      letter-spacing: .08em; text-transform: uppercase; padding: 8px 20px; margin-top: 8px;
+    }
+    .nav-item {
+      display: flex; align-items: center; gap: 10px; padding: 10px 20px;
+      color: rgba(255,255,255,.7); font-size: 14px; position: relative;
+      transition: background .15s, color .15s;
+    }
+    .nav-item:hover { background: rgba(255,255,255,.08); color: #fff; }
+    .nav-item.active { background: rgba(255,255,255,.12); color: #fff; font-weight: 600; }
+    .nav-item.active::before {
+      content: ''; position: absolute; left: 0; top: 6px; bottom: 6px;
+      width: 3px; background: var(--primary-light); border-radius: 0 2px 2px 0;
+    }
+    .nav-icon { font-size: 18px; width: 22px; text-align: center; flex-shrink: 0; }
+    .sidebar-footer { padding: 16px; border-top: 1px solid rgba(255,255,255,.1); }
+    .user-card {
+      display: flex; align-items: center; gap: 10px; padding: 8px 10px;
+      border-radius: 8px; background: rgba(255,255,255,.06);
+    }
+    .user-avatar {
+      width: 34px; height: 34px; border-radius: 50%;
+      background: var(--primary-light); display: flex; align-items: center;
+      justify-content: center; color: #fff; font-size: 14px; font-weight: 700; flex-shrink: 0;
+    }
+    .user-info { flex: 1; min-width: 0; }
+    .user-name { color: #fff; font-size: 13px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .user-role { color: rgba(255,255,255,.5); font-size: 11px; }
+    .btn-logout { background: none; padding: 4px; color: rgba(255,255,255,.4); font-size: 16px; transition: color .15s; }
+    .btn-logout:hover { color: rgba(255,255,255,.8); }
+
+    /* ── 主区域 ───────────────────────────────────────────── */
+    .main-wrap { flex: 1; margin-left: var(--sidebar-w); display: flex; flex-direction: column; min-height: 100vh; }
+    .topbar {
+      height: var(--topbar-h); background: var(--card-bg);
+      border-bottom: 1px solid var(--border);
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 0 28px; position: sticky; top: 0; z-index: 50;
+    }
+    .topbar-title { font-size: 18px; font-weight: 700; }
+    .topbar-right { display: flex; align-items: center; gap: 12px; }
+    .page-content { flex: 1; padding: 28px; overflow-y: auto; }
+    .breadcrumb { font-size: 13px; color: var(--text-light); margin-bottom: 20px; }
+    .breadcrumb a { color: var(--primary-light); }
+    .breadcrumb span { color: var(--text); font-weight: 500; }
+
+    /* ── 按钮 ─────────────────────────────────────────────── */
+    .btn {
+      height: 36px; padding: 0 16px; border-radius: 8px;
+      font-size: 13px; font-weight: 600;
+      display: inline-flex; align-items: center; gap: 6px; transition: all .15s;
+    }
+    .btn-primary { background: var(--primary); color: #fff; }
+    .btn-primary:hover { background: var(--primary-light); }
+    .btn-outline { background: transparent; color: var(--text); border: 1px solid var(--border); }
+    .btn-outline:hover { background: var(--bg); }
+    .btn-danger { background: var(--danger); color: #fff; }
+    .btn-danger:hover { background: #b91c1c; }
+    .btn:disabled { opacity: .45; cursor: not-allowed; }
+
+    /* ── 双栏布局：左创建表单 + 右列表 ────────────────────── */
+    .layout-two-col {
+      display: grid;
+      grid-template-columns: 360px 1fr;
+      gap: 24px;
+      align-items: flex-start;
+    }
+
+    /* ── 创建租户表单卡片 ─────────────────────────────────── */
+    .form-card {
+      background: var(--card-bg); border-radius: var(--radius);
+      box-shadow: var(--shadow); overflow: hidden; position: sticky; top: 88px;
+    }
+    .form-card-header {
+      padding: 18px 24px; border-bottom: 1px solid var(--border);
+      display: flex; align-items: center; justify-content: space-between;
+    }
+    .form-card-title { font-size: 15px; font-weight: 700; }
+    .form-body { padding: 20px 24px; }
+    .form-group { margin-bottom: 18px; }
+    .form-label {
+      display: block; font-size: 12px; font-weight: 600;
+      color: var(--text-light); margin-bottom: 6px; text-transform: uppercase; letter-spacing: .05em;
+    }
+    .form-label .required { color: var(--danger); margin-left: 2px; }
+    .form-input {
+      width: 100%; height: 38px;
+      padding: 0 12px; border: 1px solid var(--border);
+      border-radius: 8px; font-size: 13px; color: var(--text);
+      transition: border .15s, box-shadow .15s;
+    }
+    .form-input:focus {
+      border-color: var(--primary-light);
+      box-shadow: 0 0 0 3px rgba(59,130,246,.1);
+    }
+    .form-input.error { border-color: var(--danger); }
+    .form-hint { font-size: 11px; color: var(--text-light); margin-top: 4px; }
+    .form-error { font-size: 11px; color: var(--danger); margin-top: 4px; display: none; }
+    .form-error.show { display: block; }
+    .form-row { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+    .form-footer {
+      padding: 16px 24px; border-top: 1px solid var(--border);
+      display: flex; gap: 10px;
+    }
+    .form-footer .btn { flex: 1; justify-content: center; }
+
+    /* ── 租户列表卡片 ─────────────────────────────────────── */
+    .tenant-list-card {
+      background: var(--card-bg); border-radius: var(--radius);
+      box-shadow: var(--shadow); overflow: hidden;
+    }
+    .card-header {
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 16px 24px; border-bottom: 1px solid var(--border);
+    }
+    .card-title { font-size: 15px; font-weight: 700; }
+    .card-count { font-size: 13px; color: var(--text-light); }
+
+    /* 搜索栏 */
+    .search-bar { padding: 12px 20px; border-bottom: 1px solid var(--border); }
+    .search-wrap { position: relative; }
+    .search-input {
+      width: 100%; height: 34px; padding: 0 12px 0 32px;
+      border: 1px solid var(--border); border-radius: 7px;
+      font-size: 13px; color: var(--text);
+    }
+    .search-input:focus { border-color: var(--primary-light); }
+    .search-icon { position: absolute; left: 9px; top: 50%; transform: translateY(-50%); font-size: 14px; color: var(--text-light); pointer-events: none; }
+
+    /* 租户卡片网格 */
+    .tenant-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+      gap: 16px;
+      padding: 20px;
+    }
+    .tenant-card {
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 18px;
+      transition: box-shadow .15s, border-color .15s;
+      position: relative;
+    }
+    .tenant-card:hover {
+      box-shadow: 0 4px 16px rgba(0,0,0,.08);
+      border-color: var(--primary-light);
+    }
+    .tenant-card-top {
+      display: flex; align-items: flex-start; justify-content: space-between;
+      margin-bottom: 12px;
+    }
+    .tenant-icon {
+      width: 44px; height: 44px;
+      border-radius: 10px; background: #dbeafe;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 22px; flex-shrink: 0;
+    }
+    .tenant-badge-wrap { display: flex; flex-direction: column; align-items: flex-end; gap: 4px; }
+
+    /* 状态徽章 */
+    .badge {
+      display: inline-flex; align-items: center; gap: 4px;
+      padding: 3px 10px; border-radius: 20px; font-size: 11px; font-weight: 600;
+    }
+    .badge-success { background: #d1fae5; color: #065f46; }
+    .badge-danger  { background: #fee2e2; color: #7f1d1d; }
+    .badge-warning { background: #fef3c7; color: #78350f; }
+    .badge-default { background: #f1f5f9; color: #475569; }
+
+    .tenant-name { font-size: 15px; font-weight: 700; margin-bottom: 2px; }
+    .tenant-code { font-size: 11px; color: var(--text-light); font-family: monospace; margin-bottom: 10px; }
+
+    /* 指标行 */
+    .tenant-metrics {
+      display: grid; grid-template-columns: repeat(3, 1fr);
+      gap: 8px; margin-bottom: 14px;
+    }
+    .metric-item { text-align: center; }
+    .metric-value { font-size: 18px; font-weight: 700; color: var(--text); }
+    .metric-label { font-size: 10px; color: var(--text-light); }
+
+    /* 配额条 */
+    .quota-row {
+      display: flex; align-items: center; gap: 8px;
+      font-size: 12px; margin-bottom: 8px;
+    }
+    .quota-label { width: 60px; color: var(--text-light); flex-shrink: 0; }
+    .quota-bar { flex: 1; height: 5px; background: var(--bg); border-radius: 3px; overflow: hidden; }
+    .quota-fill { height: 100%; border-radius: 3px; transition: width .4s; }
+    .quota-text { width: 45px; text-align: right; color: var(--text); font-weight: 600; }
+
+    .tenant-footer {
+      display: flex; align-items: center; justify-content: space-between;
+      padding-top: 12px; border-top: 1px solid var(--border);
+      font-size: 12px; color: var(--text-light);
+    }
+    .tenant-actions { display: flex; gap: 6px; }
+    .icon-btn {
+      width: 28px; height: 28px; border-radius: 6px;
+      background: var(--bg); display: flex; align-items: center; justify-content: center;
+      font-size: 14px; transition: all .15s;
+    }
+    .icon-btn:hover { background: #e2e8f0; }
+    .icon-btn.danger:hover { background: #fee2e2; }
+
+    /* 空状态 */
+    .empty-state { text-align: center; padding: 60px 24px; color: var(--text-light); }
+    .empty-icon { font-size: 52px; margin-bottom: 12px; opacity: .4; }
+    .empty-text { font-size: 14px; }
+
+    /* ── 租户详情模态框 ───────────────────────────────────── */
+    .modal-overlay {
+      position: fixed; inset: 0; background: rgba(0,0,0,.45);
+      display: flex; align-items: center; justify-content: center;
+      z-index: 500; opacity: 0; pointer-events: none; transition: opacity .2s;
+    }
+    .modal-overlay.show { opacity: 1; pointer-events: auto; }
+    .modal {
+      background: var(--card-bg); border-radius: var(--radius);
+      padding: 28px; width: 480px; max-width: 95vw; max-height: 85vh; overflow-y: auto;
+      box-shadow: 0 20px 40px rgba(0,0,0,.15);
+      transform: scale(.95); transition: transform .2s;
+    }
+    .modal-overlay.show .modal { transform: scale(1); }
+    .modal-header {
+      display: flex; align-items: center; justify-content: space-between;
+      margin-bottom: 20px;
+    }
+    .modal-title { font-size: 17px; font-weight: 700; }
+    .modal-close {
+      width: 30px; height: 30px; border-radius: 6px;
+      background: var(--bg); font-size: 16px;
+      display: flex; align-items: center; justify-content: center;
+    }
+    .modal-close:hover { background: var(--border); }
+    .detail-row { display: flex; align-items: flex-start; padding: 10px 0; border-bottom: 1px solid var(--border); gap: 12px; }
+    .detail-row:last-child { border-bottom: none; }
+    .detail-label { width: 90px; font-size: 12px; color: var(--text-light); flex-shrink: 0; padding-top: 2px; }
+    .detail-value { flex: 1; font-size: 13px; word-break: break-all; }
+
+    /* ── 确认框（通用）─────────────────────────────────────── */
+    .confirm-modal-inner {
+      text-align: center;
+    }
+    .confirm-icon { font-size: 40px; margin-bottom: 12px; }
+    .confirm-title { font-size: 16px; font-weight: 700; margin-bottom: 8px; }
+    .confirm-desc { font-size: 13px; color: var(--text-light); margin-bottom: 24px; line-height: 1.6; }
+    .confirm-actions { display: flex; gap: 12px; }
+    .confirm-actions .btn { flex: 1; justify-content: center; height: 40px; }
+
+    /* ── Toast ────────────────────────────────────────────── */
+    #toast-container {
+      position: fixed; top: 20px; right: 20px;
+      z-index: 9999; display: flex; flex-direction: column; gap: 8px;
+    }
+    .toast {
+      background: #1e293b; color: #fff; padding: 10px 18px;
+      border-radius: 8px; font-size: 13px; box-shadow: 0 4px 12px rgba(0,0,0,.25);
+      animation: slideIn .25s ease;
+    }
+    .toast.success { border-left: 4px solid var(--success); }
+    .toast.error   { border-left: 4px solid var(--danger); }
+    .toast.warning { border-left: 4px solid var(--warning); }
+    @keyframes slideIn { from { transform: translateX(40px); opacity: 0; } }
+
+    @media (max-width: 1100px) {
+      .layout-two-col { grid-template-columns: 1fr; }
+      .form-card { position: static; }
+    }
+    /* 角色选项选中态高亮 */
+    input[name="init-role"]:checked + span { color: var(--primary); }
+    #role-opt-admin:has(input:checked),
+    #role-opt-user:has(input:checked)  { border-color: var(--primary); background: var(--primary-bg, #f0f4ff); }
+  </style>
+</head>
+<body>
+
+<!-- ══════════════════════════════════════════════════════════
+     侧边栏
+══════════════════════════════════════════════════════════ -->
+<aside class="sidebar">
+  <div class="sidebar-brand">
+    <div class="brand-icon">📋</div>
+    <div>
+      <div class="brand-text">票据智能顾问</div>
+      <div class="brand-sub">管理后台</div>
+    </div>
+  </div>
+  <nav class="sidebar-nav">
+    <div class="nav-section-title">核心功能</div>
+    <a href="./index.html"     class="nav-item"><span class="nav-icon">📊</span>仪表板</a>
+    <a href="./documents.html" class="nav-item"><span class="nav-icon">📁</span>文档管理</a>
+    <a href="./tenants.html"   class="nav-item active"><span class="nav-icon">🏢</span>租户管理</a>
+    <a href="./analytics.html" class="nav-item"><span class="nav-icon">🔍</span>检索分析</a>
+    <div class="nav-section-title">系统</div>
+    <a href="./monitor.html"   class="nav-item"><span class="nav-icon">📡</span>系统监控</a>
+    <a href="../chat.html"     class="nav-item"><span class="nav-icon">💬</span>用户端聊天</a>
+  </nav>
+  <div class="sidebar-footer">
+    <div class="user-card">
+      <div class="user-avatar" id="user-avatar-text">A</div>
+      <div class="user-info">
+        <div class="user-name" id="sidebar-username">管理员</div>
+        <div class="user-role">系统管理员</div>
+      </div>
+      <button class="btn-logout" id="btn-logout">⎋</button>
+    </div>
+  </div>
+</aside>
+
+<!-- ══════════════════════════════════════════════════════════
+     主内容区
+══════════════════════════════════════════════════════════ -->
+<div class="main-wrap">
+  <header class="topbar">
+    <div class="topbar-title">租户管理</div>
+    <div class="topbar-right">
+      <button class="btn btn-outline" id="btn-reload">🔄 刷新</button>
+    </div>
+  </header>
+
+  <main class="page-content">
+    <div class="breadcrumb">
+      <a href="./index.html">管理后台</a> / <span>租户管理</span>
+    </div>
+
+    <div class="layout-two-col">
+
+      <!-- ── 左列：创建租户表单 ── -->
+      <div class="form-card">
+        <div class="form-card-header">
+          <div class="form-card-title">🏢 新建租户</div>
+        </div>
+        <form class="form-body" id="create-tenant-form" novalidate>
+
+          <!-- 租户名称 -->
+          <div class="form-group">
+            <label class="form-label">租户名称 <span class="required">*</span></label>
+            <input type="text" class="form-input" id="f-name"
+                   placeholder="例：中国建设银行上海分行" maxlength="100" />
+            <div class="form-error" id="e-name">请输入租户名称</div>
+          </div>
+
+          <!-- 租户代码由后端自动生成，无需填写 -->
+
+          <!-- 营业执照号（可选）-->
+          <div class="form-group">
+            <label class="form-label">营业执照号</label>
+            <input type="text" class="form-input" id="f-license"
+                   placeholder="可选，18 位统一社会信用代码" maxlength="50" />
+          </div>
+
+          <!-- 配额设置 -->
+          <div class="form-row">
+            <!-- 文档配额 -->
+            <div class="form-group">
+              <label class="form-label">文档配额</label>
+              <input type="number" class="form-input" id="f-doc-quota"
+                     placeholder="默认 1000" min="1" max="100000" />
+              <div class="form-hint">最多可上传文档数</div>
+            </div>
+            <!-- QPS 限制 -->
+            <div class="form-group">
+              <label class="form-label">QPS 限制</label>
+              <input type="number" class="form-input" id="f-qps"
+                     placeholder="默认 10" min="1" max="1000" />
+              <div class="form-hint">每秒最大查询次数</div>
+            </div>
+          </div>
+
+          <!-- 分隔线 -->
+          <div style="border-top:1px solid var(--border);margin:8px 0 16px;"></div>
+
+          <!-- 初始账号（可选） -->
+          <div class="form-group">
+            <label class="form-label" style="font-weight:600;">初始账号 <span style="font-weight:400;color:var(--text-light);font-size:12px;">（可选，创建租户时同步建号）</span></label>
+          </div>
+
+          <!-- 角色选择 -->
+          <div class="form-group">
+            <label class="form-label">账号角色</label>
+            <div style="display:flex;gap:12px;margin-top:4px;">
+              <label style="display:flex;align-items:center;gap:6px;cursor:pointer;padding:8px 14px;border:1px solid var(--border);border-radius:8px;flex:1;transition:border-color .2s;" id="role-opt-admin">
+                <input type="radio" name="init-role" value="tenant_admin" id="r-admin" style="accent-color:var(--primary);" />
+                <span>
+                  <strong style="font-size:13px;">管理员</strong>
+                  <span style="display:block;font-size:11px;color:var(--text-light);">管理本租户文档与用户</span>
+                </span>
+              </label>
+              <label style="display:flex;align-items:center;gap:6px;cursor:pointer;padding:8px 14px;border:1px solid var(--border);border-radius:8px;flex:1;transition:border-color .2s;" id="role-opt-user">
+                <input type="radio" name="init-role" value="user" id="r-user" checked style="accent-color:var(--primary);" />
+                <span>
+                  <strong style="font-size:13px;">普通用户</strong>
+                  <span style="display:block;font-size:11px;color:var(--text-light);">问答聊天与票据识别</span>
+                </span>
+              </label>
+            </div>
+          </div>
+
+          <!-- 用户名 + 密码 -->
+          <div class="form-row">
+            <div class="form-group">
+              <label class="form-label">用户名</label>
+              <input type="text" class="form-input" id="f-init-username"
+                     placeholder="不填则不建账号" maxlength="50" autocomplete="off" />
+              <div class="form-error" id="e-init-username">用户名至少 3 个字符</div>
+            </div>
+            <div class="form-group">
+              <label class="form-label">密码</label>
+              <input type="password" class="form-input" id="f-init-password"
+                     placeholder="至少 8 位" maxlength="64" autocomplete="new-password" />
+              <div class="form-error" id="e-init-password">密码至少 8 位</div>
+            </div>
+          </div>
+
+        </form>
+        <div class="form-footer">
+          <button class="btn btn-outline" type="button" id="btn-reset-form">重置</button>
+          <button class="btn btn-primary" type="button" id="btn-create-tenant">
+            ✚ 创建租户
+          </button>
+        </div>
+      </div>
+
+      <!-- ── 右列：租户列表 ── -->
+      <div class="tenant-list-card">
+        <div class="card-header">
+          <div class="card-title">租户列表</div>
+          <div class="card-count" id="tenant-count">共 0 个租户</div>
+        </div>
+
+        <!-- 搜索 -->
+        <div class="search-bar">
+          <div class="search-wrap">
+            <span class="search-icon">🔍</span>
+            <input type="text" class="search-input" id="tenant-search" placeholder="搜索租户名称或代码…" />
+          </div>
+        </div>
+
+        <!-- 租户卡片网格 -->
+        <div class="tenant-grid" id="tenant-grid">
+          <div style="grid-column:1/-1;text-align:center;padding:40px;color:var(--text-light);">加载中...</div>
+        </div>
+      </div>
+    </div>
+  </main>
+</div>
+
+<!-- ── 租户详情模态框 ── -->
+<div class="modal-overlay" id="detail-modal">
+  <div class="modal">
+    <div class="modal-header">
+      <div class="modal-title" id="detail-modal-title">租户详情</div>
+      <button class="modal-close" id="detail-modal-close">✕</button>
+    </div>
+    <div id="detail-modal-body">
+      <!-- 由 JS 填充 -->
+    </div>
+  </div>
+</div>
+
+<!-- ── 删除确认模态框 ── -->
+<div class="modal-overlay" id="confirm-modal">
+  <div class="modal">
+    <div class="confirm-modal-inner">
+      <div class="confirm-icon">⚠️</div>
+      <div class="confirm-title">确认停用租户？</div>
+      <div class="confirm-desc" id="confirm-desc">停用后租户将无法使用系统，此操作可联系超级管理员恢复。</div>
+      <div class="confirm-actions">
+        <button class="btn btn-outline" id="confirm-cancel">取消</button>
+        <button class="btn btn-danger" id="confirm-ok">确认停用</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Toast -->
+<div id="toast-container"></div>
+
+<script src="../js/config.js"></script>
+<script src="../js/auth.js"></script>
+<script src="../js/utils.js"></script>
+<script src="../js/api.js?v=2"></script>
+
+<script>
+/* ══════════════════════════════════════════════════════════
+   tenants.js — 租户管理页面逻辑
+══════════════════════════════════════════════════════════ */
+
+// ── 路由守卫 ─────────────────────────────────────────────────
+Auth.guardRoute(CONFIG.ROLE.ADMIN);
+
+// ── DOM 引用 ──────────────────────────────────────────────────
+const $tenantGrid   = document.getElementById('tenant-grid');
+const $tenantCount  = document.getElementById('tenant-count');
+const $tenantSearch = document.getElementById('tenant-search');
+
+// ── 状态 ─────────────────────────────────────────────────────
+let _allTenants = [];             // 原始租户列表
+let _pendingDeactivate = null;    // 待停用的租户 ID
+
+// ── 初始化用户信息 & 角色权限 ─────────────────────────────────
+const _isSuperAdmin = (function initUser() {
+  const user = Auth.getUser();
+  if (!user) return false;
+  const name = user.username || '管理员';
+  document.getElementById('sidebar-username').textContent = name;
+  document.getElementById('user-avatar-text').textContent = name.charAt(0).toUpperCase();
+
+  const isSuperAdmin = user.backendRole === 'super_admin';
+  if (!isSuperAdmin) {
+    // tenant_admin：隐藏创建租户表单，布局切换为单栏
+    const formCard = document.querySelector('.form-card');
+    if (formCard) formCard.style.display = 'none';
+    const layout = document.querySelector('.layout-two-col');
+    if (layout) layout.style.gridTemplateColumns = '1fr';
+  }
+  return isSuperAdmin;
+})();
+
+document.getElementById('btn-logout').addEventListener('click', () => Auth.logout());
+document.getElementById('btn-reload').addEventListener('click', loadTenants);
+
+/* ────────────────────────────────────────────────────────────
+   创建租户表单
+──────────────────────────────────────────────────────────── */
+
+/** 清空表单错误状态 */
+function clearFormErrors() {
+  document.querySelectorAll('.form-error').forEach(el => el.classList.remove('show'));
+  document.querySelectorAll('.form-input').forEach(el => el.classList.remove('error'));
+}
+
+/** 重置整个表单 */
+function resetForm() {
+  document.getElementById('create-tenant-form').reset();
+  clearFormErrors();
+}
+
+document.getElementById('btn-reset-form').addEventListener('click', resetForm);
+
+/**
+ * 校验字段，返回 true 表示通过
+ * @param {string} fieldId - input ID
+ * @param {string} errorId - 错误提示 ID
+ * @param {function} validator - (value) => boolean
+ */
+function validateField(fieldId, errorId, validator) {
+  const input = document.getElementById(fieldId);
+  const errorEl = document.getElementById(errorId);
+  const val = input.value.trim();
+  const ok = validator(val);
+  input.classList.toggle('error', !ok);
+  if (errorEl) errorEl.classList.toggle('show', !ok);
+  return ok;
+}
+
+// 创建租户按钮
+document.getElementById('btn-create-tenant').addEventListener('click', async () => {
+  clearFormErrors();
+
+  // 校验租户名称
+  const nameOk = validateField('f-name', 'e-name', v => v.length > 0);
+
+  // 初始账号：有用户名则校验用户名和密码
+  const initUsername = document.getElementById('f-init-username').value.trim();
+  const initPassword = document.getElementById('f-init-password').value;
+  const hasInitUser  = initUsername.length > 0;
+
+  let userOk = true;
+  if (hasInitUser) {
+    const unOk  = validateField('f-init-username', 'e-init-username', v => v.length >= 3);
+    const pwOk  = validateField('f-init-password', 'e-init-password', v => v.length >= 8);
+    userOk = unOk && pwOk;
+  }
+
+  if (!nameOk || !userOk) return;
+
+  const btn = document.getElementById('btn-create-tenant');
+  btn.disabled = true;
+  btn.textContent = '创建中...';
+
+  // 构造租户请求体
+  const payload = { name: document.getElementById('f-name').value.trim() };
+  const licenseVal = document.getElementById('f-license').value.trim();
+  if (licenseVal) payload.license_no = licenseVal;
+  const docQuota = parseInt(document.getElementById('f-doc-quota').value);
+  if (!isNaN(docQuota) && docQuota > 0) payload.doc_quota = docQuota;
+  const qps = parseInt(document.getElementById('f-qps').value);
+  if (!isNaN(qps) && qps > 0) payload.qps_limit = qps;
+
+  try {
+    // 第一步：创建或复用租户（后端按 license_no 查重）
+    const tenant = await API.tenants.create(payload);
+    // 后端返回已有租户时，id 与请求的 license_no 对应的租户一致
+    const isExisting = payload.license_no && tenant.license_no === payload.license_no
+                       && tenant.name !== payload.name.trim() === false;
+    const tenantLabel = isExisting ? `已存在的租户「${tenant.name}」` : `新租户「${tenant.name}」`;
+
+    // 第二步：若填了初始账号，在该租户下注册
+    if (hasInitUser) {
+      const initRole = document.querySelector('input[name="init-role"]:checked')?.value || 'user';
+      try {
+        await API.auth.register({
+          username:  initUsername,
+          password:  initPassword,
+          role:      initRole,
+          tenant_id: tenant.id,
+        });
+        const roleLabel = initRole === 'tenant_admin' ? '管理员' : '普通用户';
+        Utils.toast(`${tenantLabel}，已创建${roleLabel}账号「${initUsername}」`, 'success');
+      } catch (ue) {
+        Utils.toast(`租户已就绪，但账号注册失败：${ue.message}`, 'warning');
+      }
+    } else {
+      Utils.toast(`${tenantLabel} 已就绪`, 'success');
+    }
+
+    resetForm();
+    await loadTenants();
+  } catch (e) {
+    Utils.toast('创建失败: ' + e.message, 'error');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '✚ 创建租户';
+  }
+});
+
+/* ────────────────────────────────────────────────────────────
+   加载租户列表
+──────────────────────────────────────────────────────────── */
+async function loadTenants() {
+  $tenantGrid.innerHTML = '<div style="grid-column:1/-1;text-align:center;padding:40px;color:var(--text-light);">加载中...</div>';
+
+  try {
+    const resp = await API.tenants.list();
+    // 后端可能直接返回数组或 {tenants:[...]}
+    _allTenants = Array.isArray(resp) ? resp : (resp?.tenants ?? []);
+    $tenantCount.textContent = `共 ${_allTenants.length} 个租户`;
+    renderTenants(_allTenants);
+  } catch (e) {
+    console.error('加载租户失败', e);
+    $tenantGrid.innerHTML = `
+      <div style="grid-column:1/-1;">
+        <div class="empty-state">
+          <div class="empty-icon">⚠️</div>
+          <div class="empty-text">加载失败：${Utils.escapeHtml(e.message)}</div>
+        </div>
+      </div>
+    `;
+  }
+}
+
+/* ────────────────────────────────────────────────────────────
+   渲染租户卡片网格
+──────────────────────────────────────────────────────────── */
+function renderTenants(tenants) {
+  if (tenants.length === 0) {
+    $tenantGrid.innerHTML = `
+      <div style="grid-column:1/-1;">
+        <div class="empty-state">
+          <div class="empty-icon">🏢</div>
+          <div class="empty-text">${_isSuperAdmin ? '暂无租户，请在左侧表单创建第一个租户' : '暂无租户数据'}</div>
+        </div>
+      </div>
+    `;
+    return;
+  }
+
+  $tenantGrid.innerHTML = tenants.map(t => {
+    const statusBadge = Utils.tenantStatusBadge(t.status || 'active');
+    const id = t.id || t.tenant_id;
+
+    // 配额使用率（若后端返回 used 字段）
+    const docUsed  = t.doc_count ?? t.docs_used ?? 0;
+    const docQuota = t.doc_quota ?? t.doc_limit ?? 1000;
+    const docPct   = Math.min(100, Math.round(docUsed / docQuota * 100));
+    const docColor = docPct >= 90 ? '#dc2626' : docPct >= 70 ? '#d97706' : '#059669';
+
+    return `
+      <div class="tenant-card">
+        <div class="tenant-card-top">
+          <div class="tenant-icon">🏢</div>
+          <div class="tenant-badge-wrap">
+            <span class="badge ${statusBadge.colorClass}">${statusBadge.label}</span>
+          </div>
+        </div>
+
+        <!-- 名称与代码 -->
+        <div class="tenant-name" title="${Utils.escapeHtml(t.name)}">${Utils.escapeHtml(t.name)}</div>
+        <div class="tenant-code"># ${Utils.escapeHtml(t.code || t.tenant_code || '-')}</div>
+
+        <!-- 关键指标 -->
+        <div class="tenant-metrics">
+          <div class="metric-item">
+            <div class="metric-value">${Utils.formatNumber(docUsed)}</div>
+            <div class="metric-label">文档数</div>
+          </div>
+          <div class="metric-item">
+            <div class="metric-value">${t.qps_limit ?? t.qps ?? '-'}</div>
+            <div class="metric-label">QPS 限制</div>
+          </div>
+          <div class="metric-item">
+            <div class="metric-value">${t.query_count ?? '-'}</div>
+            <div class="metric-label">总查询</div>
+          </div>
+        </div>
+
+        <!-- 文档配额进度条 -->
+        <div class="quota-row">
+          <div class="quota-label">文档配额</div>
+          <div class="quota-bar">
+            <div class="quota-fill" style="width:${docPct}%;background:${docColor};"></div>
+          </div>
+          <div class="quota-text">${docUsed}/${docQuota}</div>
+        </div>
+
+        <!-- 底部：创建时间 + 操作 -->
+        <div class="tenant-footer">
+          <span>创建于 ${Utils.formatDate(t.created_at)}</span>
+          <div class="tenant-actions">
+            <!-- 查看详情 -->
+            <button class="icon-btn" onclick="showTenantDetail('${id}')" title="查看详情">🔍</button>
+            <!-- 查看统计 -->
+            <button class="icon-btn" onclick="showTenantStats('${id}','${Utils.escapeHtml(t.name)}')" title="查看统计">📊</button>
+          </div>
+        </div>
+      </div>
+    `;
+  }).join('');
+}
+
+/* ────────────────────────────────────────────────────────────
+   搜索过滤（纯前端）
+──────────────────────────────────────────────────────────── */
+let _searchTimer = null;
+$tenantSearch.addEventListener('input', () => {
+  clearTimeout(_searchTimer);
+  _searchTimer = setTimeout(() => {
+    const kw = $tenantSearch.value.trim().toLowerCase();
+    const filtered = kw
+      ? _allTenants.filter(t =>
+          (t.name || '').toLowerCase().includes(kw) ||
+          (t.code || t.tenant_code || '').toLowerCase().includes(kw)
+        )
+      : _allTenants;
+    renderTenants(filtered);
+  }, 250);
+});
+
+/* ────────────────────────────────────────────────────────────
+   租户详情模态框
+──────────────────────────────────────────────────────────── */
+
+const $detailModal = document.getElementById('detail-modal');
+const $detailBody  = document.getElementById('detail-modal-body');
+
+/** 展示从已加载列表中找到的租户详情 */
+function showTenantDetail(tenantId) {
+  const tenant = _allTenants.find(t => String(t.id || t.tenant_id) === String(tenantId));
+  if (!tenant) return;
+
+  const statusBadge = Utils.tenantStatusBadge(tenant.status || 'active');
+  document.getElementById('detail-modal-title').textContent = tenant.name;
+  $detailBody.innerHTML = `
+    <div class="detail-row">
+      <div class="detail-label">租户名称</div>
+      <div class="detail-value"><strong>${Utils.escapeHtml(tenant.name)}</strong></div>
+    </div>
+    <div class="detail-row">
+      <div class="detail-label">租户代码</div>
+      <div class="detail-value" style="font-family:monospace;">${Utils.escapeHtml(tenant.code || tenant.tenant_code || '-')}</div>
+    </div>
+    <div class="detail-row">
+      <div class="detail-label">租户 ID</div>
+      <div class="detail-value" style="font-family:monospace;font-size:11px;">${Utils.escapeHtml(String(tenant.id || tenant.tenant_id))}</div>
+    </div>
+    <div class="detail-row">
+      <div class="detail-label">状态</div>
+      <div class="detail-value"><span class="badge ${statusBadge.colorClass}">${statusBadge.label}</span></div>
+    </div>
+    <div class="detail-row">
+      <div class="detail-label">营业执照</div>
+      <div class="detail-value">${Utils.escapeHtml(tenant.license_no || '-')}</div>
+    </div>
+    <div class="detail-row">
+      <div class="detail-label">文档配额</div>
+      <div class="detail-value">${tenant.doc_quota ?? '-'} 份</div>
+    </div>
+    <div class="detail-row">
+      <div class="detail-label">QPS 限制</div>
+      <div class="detail-value">${tenant.qps_limit ?? tenant.qps ?? '-'} 次/秒</div>
+    </div>
+    <div class="detail-row">
+      <div class="detail-label">创建时间</div>
+      <div class="detail-value">${Utils.formatDate(tenant.created_at, true)}</div>
+    </div>
+    <div class="detail-row">
+      <div class="detail-label">更新时间</div>
+      <div class="detail-value">${Utils.formatDate(tenant.updated_at, true)}</div>
+    </div>
+  `;
+  $detailModal.classList.add('show');
+}
+
+// 关闭详情模态
+document.getElementById('detail-modal-close').addEventListener('click', () => {
+  $detailModal.classList.remove('show');
+});
+$detailModal.addEventListener('click', (e) => {
+  if (e.target === $detailModal) $detailModal.classList.remove('show');  // 点击蒙层关闭
+});
+
+/* ────────────────────────────────────────────────────────────
+   租户统计数据（调用 API.tenants.stats）
+──────────────────────────────────────────────────────────── */
+async function showTenantStats(tenantId, tenantName) {
+  document.getElementById('detail-modal-title').textContent = `${tenantName} — 统计`;
+  $detailBody.innerHTML = '<div style="text-align:center;padding:30px;color:var(--text-light);">加载中...</div>';
+  $detailModal.classList.add('show');
+
+  try {
+    const stats = await API.tenants.stats(tenantId);
+    $detailBody.innerHTML = `
+      <div class="detail-row">
+        <div class="detail-label">文档总数</div>
+        <div class="detail-value">${Utils.formatNumber(stats.doc_count ?? 0)} 份</div>
+      </div>
+      <div class="detail-row">
+        <div class="detail-label">处理成功</div>
+        <div class="detail-value">${Utils.formatNumber(stats.completed_count ?? 0)} 份</div>
+      </div>
+      <div class="detail-row">
+        <div class="detail-label">处理失败</div>
+        <div class="detail-value" style="color:var(--danger);">${Utils.formatNumber(stats.failed_count ?? 0)} 份</div>
+      </div>
+      <div class="detail-row">
+        <div class="detail-label">分块总量</div>
+        <div class="detail-value">${Utils.formatNumber(stats.chunk_count ?? 0)} 个</div>
+      </div>
+      <div class="detail-row">
+        <div class="detail-label">查询总量</div>
+        <div class="detail-value">${Utils.formatNumber(stats.query_count ?? 0)} 次</div>
+      </div>
+      <div class="detail-row">
+        <div class="detail-label">今日查询</div>
+        <div class="detail-value">${Utils.formatNumber(stats.today_query_count ?? 0)} 次</div>
+      </div>
+      <div class="detail-row">
+        <div class="detail-label">平均响应</div>
+        <div class="detail-value">${Utils.formatDuration(stats.avg_latency_ms ?? null)}</div>
+      </div>
+      <div class="detail-row">
+        <div class="detail-label">统计时间</div>
+        <div class="detail-value">${new Date().toLocaleString('zh-CN')}</div>
+      </div>
+    `;
+  } catch (e) {
+    $detailBody.innerHTML = `<div style="color:var(--danger);padding:20px;">加载失败：${Utils.escapeHtml(e.message)}</div>`;
+  }
+}
+
+/* ── 初始加载 ─────────────────────────────────────────────── */
+loadTenants();
+</script>
+</body>
+</html>

@@ -56,9 +56,9 @@ class MetricsService:
         )
 
         # ── 直方图（Histogram）：记录耗时分布，用于计算 P95、P99 等百分位延迟 ──────
-        # 延迟分桶：0.1ms, 0.25ms, 0.5ms, 1ms, 2.5ms, 5s, 10s, 30s, 60s
-        # 系统会记录每个桶（区间）有多少个请求，从而计算百分位
-        latency_buckets = (0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0)
+        # 延迟分桶（毫秒）：50ms → 60000ms，覆盖 Embedding/Milvus/LLM/总耗时全范围
+        # 注意：各指标单位均为毫秒，桶边界也必须是毫秒级别
+        latency_buckets = (50, 100, 200, 500, 1000, 2000, 5000, 10000, 30000, 60000)
 
         self.embedding_latency = Histogram(
             "bill_rag_embedding_latency_ms",
@@ -213,7 +213,17 @@ class MetricsService:
     def set_doc_count(self, tenant_id: str, count: int):
         """更新某租户的文档数量（Gauge 类型，可以设置任意值）"""
         if not self._check(): return
-        self.doc_count.labels(tenant_id=tenant_id).set(count)  # set()：直接设置值
+        self.doc_count.labels(tenant_id=tenant_id).set(count)
+
+    def set_chunk_count(self, tenant_id: str, count: int):
+        """更新某租户的 chunk 总数"""
+        if not self._check(): return
+        self.chunk_count.labels(tenant_id=tenant_id).set(count)
+
+    def record_ocr_processed(self, pages: int, tenant_id: str = "global"):
+        """记录 OCR 处理的页数"""
+        if not self._check(): return
+        self.ocr_processed.labels(tenant_id=tenant_id).inc(pages)
 
     def generate_metrics(self) -> tuple[bytes, str]:
         """

@@ -17,7 +17,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 # 异步 SQLAlchemy（让数据库操作不阻塞）
-from app.models.db_models import Base, Tenant, User, TenantStatus   # 数据库模型
+from app.models.db_models import Base, Tenant, User, TenantStatus, UserRole  # 数据库模型
 from app.core.auth import get_password_hash                          # 密码哈希函数
 from config.settings import settings                                 # 配置（数据库连接地址）
 
@@ -61,7 +61,7 @@ async def init_admin():
             email="admin@billrag.com",     # 邮箱
             hashed_password=get_password_hash("Admin@123456"),
             # 密码 "Admin@123456" 经 bcrypt 哈希后存储（绝不存明文）
-            is_admin=True,                 # 标记为管理员
+            role=UserRole.SUPER_ADMIN,     # 超级管理员，系统唯一
             is_active=True,               # 账号激活
         )
         session.add(admin)
@@ -87,7 +87,7 @@ async def init_admin():
             username="demo",
             email="demo@billrag.com",
             hashed_password=get_password_hash("Demo@123456"),
-            is_admin=False,    # 普通用户（不是管理员）
+            role=UserRole.USER,  # 普通用户
             is_active=True,
         )
         session.add(demo_user)

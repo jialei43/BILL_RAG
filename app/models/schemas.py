@@ -32,8 +32,8 @@ class TokenResponse(BaseModel):
 class TenantCreate(BaseModel):
     """创建新租户的请求体（只有管理员才能调用）"""
     name: str = Field(..., min_length=2, max_length=200)
-    # ...：表示必填字段；min_length=2：最少 2 个字符；max_length=200：最多 200 个字符
-    code: str = Field(..., min_length=2, max_length=50)  # 机构代码，如 "ABC_BANK"
+    code: Optional[str] = Field(default=None, min_length=2, max_length=50)
+    # 可不填，后端自动生成（如 TENANT_A3F2B1）；填写时仅允许字母/数字/下划线
     license_no: Optional[str] = None    # 牌照编号，可以不填
     doc_quota: int = Field(default=10000, ge=100)
     # ge=100：大于等于 100（不能给太小的配额）；默认 10000
@@ -42,14 +42,16 @@ class TenantCreate(BaseModel):
 
 class TenantResponse(BaseModel):
     """租户信息响应体（查询租户时返回这些字段）"""
-    id: str             # 租户唯一 ID
-    name: str           # 机构名称
-    code: str           # 机构代码
-    license_no: Optional[str]  # 牌照编号（可能为空）
-    status: str         # 状态：active/suspended/trial
-    doc_quota: int      # 文档配额
-    qps_limit: int      # QPS 限制
-    created_at: datetime  # 注册时间
+    id: str
+    name: str
+    code: str
+    license_no: Optional[str]
+    status: str
+    doc_quota: int
+    qps_limit: int
+    created_at: datetime
+    doc_count: Optional[int] = None    # 文档总数（列表接口附带）
+    query_count: Optional[int] = None  # 历史查询总量（列表接口附带）
 
     class Config:
         from_attributes = True  # 允许从 SQLAlchemy 模型对象直接创建此 Schema（ORM 模式）
@@ -58,23 +60,26 @@ class TenantResponse(BaseModel):
 # ── 用户相关 Schema ──────────────────────────────────────────────────────────
 class UserCreate(BaseModel):
     """注册新用户的请求体"""
-    username: str = Field(..., min_length=3, max_length=100)  # 用户名至少 3 个字符
-    email: Optional[str] = None          # 邮箱（可选）
-    password: str = Field(..., min_length=8)  # 密码至少 8 个字符（基础安全要求）
-    is_admin: bool = False               # 是否创建为管理员（默认不是）
+    username: str = Field(..., min_length=3, max_length=100)
+    email: Optional[str] = None
+    password: str = Field(..., min_length=8)
+    role: str = Field(default="user", pattern="^(tenant_admin|user)$")
+    # 只能创建 tenant_admin 或 user，super_admin 系统唯一不允许通过接口创建
+    tenant_id: Optional[str] = None
+    # 超级管理员可指定目标租户；租户管理员不填则默认自己的租户
 
 class UserResponse(BaseModel):
     """用户信息响应体"""
-    id: str             # 用户 ID
-    username: str       # 用户名
-    email: Optional[str]  # 邮箱（可能为空）
-    is_admin: bool      # 是否是管理员
-    is_active: bool     # 账号是否激活
-    tenant_id: str      # 所属租户 ID
-    created_at: datetime  # 注册时间
+    id: str
+    username: str
+    email: Optional[str]
+    role: str             # 角色：super_admin / tenant_admin / user
+    is_active: bool
+    tenant_id: str
+    created_at: datetime
 
     class Config:
-        from_attributes = True  # 支持从 ORM 对象直接转换
+        from_attributes = True
 
 
 # ── 文档相关 Schema ──────────────────────────────────────────────────────────
@@ -91,9 +96,26 @@ class DocumentResponse(BaseModel):
     parse_meta: Optional[dict]   # 解析统计信息（如各类型表格数量）
     error_msg: Optional[str]     # 如果处理失败，这里是错误原因
     created_at: datetime  # 上传时间
+    batch_id: Optional[str] = None  # 所属批次 ID（用于批量查询状态）
 
     class Config:
         from_attributes = True
+
+
+class BatchDocItem(BaseModel):
+    """批次内单个文档的简要状态"""
+    id: str
+    filename: str
+    status: str
+    error_msg: Optional[str] = None
+    chunk_count: int = 0
+
+
+class BatchUploadResponse(BaseModel):
+    """批量上传响应：包含批次 ID 和各文件初始状态，前端用 batch_id 轮询 /documents/batch/{batch_id}"""
+    batch_id: str
+    total: int
+    documents: list[DocumentResponse]
 
 class FolderUploadRequest(BaseModel):
     """文件夹批量入库请求体：传入服务器上的文件夹路径，自动扫描所有支持的文件"""
@@ -151,13 +173,17 @@ class FeedbackRequest(BaseModel):
 # ── 统计相关 Schema ──────────────────────────────────────────────────────────
 class TenantStats(BaseModel):
     """租户使用统计信息"""
-    tenant_id: str         # 租户 ID
-    doc_count: int         # 已上传的文档数量
-    chunk_count: int       # 总片段数量（文档被切成了多少块）
-    query_count_today: int # 今天的查询次数
-    doc_quota: int         # 文档总配额上限
-    qps_limit: int         # QPS 限制
-    quota_used_pct: float  # 配额使用百分比（如 45.3 表示用了 45.3%）
+    tenant_id: str
+    doc_count: int              # 文档总数
+    completed_count: int = 0    # 处理成功数
+    failed_count: int = 0       # 处理失败数
+    chunk_count: int            # 总分块数
+    query_count: int = 0        # 历史查询总量
+    today_query_count: int = 0  # 今日查询次数
+    doc_quota: int
+    qps_limit: int
+    quota_used_pct: float
+    avg_latency_ms: Optional[float] = None  # 平均响应耗时（毫秒）
 
 
 # ── 通用响应 Schema ──────────────────────────────────────────────────────────
@@ -277,6 +303,56 @@ class QueryResponseV2(BaseModel):
     transfer_to_human: bool = False
     contact_info: Optional[dict] = None  # 转人工时附带的联系信息
     query_saved: bool = False          # 未命中时是否已保存到优化日志
+    retrieval_ms: float = 0.0
+    llm_ms: float = 0.0
+    total_ms: float = 0.0
+
+
+# ── 票据咨询 Schema（聊天窗口预检流程）───────────────────────────────────────
+class ConsultIssue(BaseModel):
+    """
+    单条审核发现问题（合规问题、风险项、背书异常等）
+    在 ConsultReport.issues 列表中列出，每项对应一个具体的审核发现
+    """
+    field: str                          # 涉及的票据要素字段（如 "endorsers"、"amount_numeric"）
+    level: str                          # 严重程度：error（违规）/ warning（警告）/ info（提示）
+    description: str                    # 问题描述（中文，供业务员理解）
+    recommendation: Optional[str] = None  # 建议处理方式（可选，如"请补充背书人签章"）
+
+
+class ConsultReport(BaseModel):
+    """
+    Agent 审核报告（聊天场景下的结构化报告）
+    由 OrchestratorAgent.run_for_chat() 生成，随 ConsultResponse 一起返回
+    """
+    audit_task_type: str               # 执行的审核类型（如 "issuance_check"）
+    audit_label: str                   # 审核类型中文标签（如 "出票合规预检"）
+    conclusion: str                    # 业务结论：可执行 / 不可执行 / 需关注 / 审核中
+    risk_level: str                    # 风险等级：LOW / MEDIUM_LOW / MEDIUM / HIGH / CRITICAL
+    overall_score: Optional[float] = None  # 综合风险评分（0-100，越低越好）
+    issues: list[ConsultIssue] = []    # 发现的问题列表（空列表表示无异常）
+    summary: str                       # 自然语言摘要（供业务员快速阅读，100-300字）
+    task_id: str                       # 对应的 audit_tasks 表 ID（可后续查询完整报告）
+    elapsed_ms: float = 0.0           # Agent 执行总耗时（毫秒）
+
+
+class ConsultResponse(BaseModel):
+    """
+    票据咨询接口响应体（POST /api/v1/query/consult）
+    统一封装 RAG 问答 和 Agent 审核报告 两种响应类型
+
+    response_type 说明：
+      - "rag_answer"：用户问的是知识性问题，走 RAG 检索，answer 是知识答案
+      - "agent_report"：用户问的是某张票据的审核问题，走 Agent，report 是结构化审核结果
+      - "off_topic"：问题与票据业务无关，answer 是引导语
+    """
+    query_id: str                      # 本次请求唯一 ID
+    intent_id: str                     # 识别到的意图
+    response_type: str                 # rag_answer / agent_report / off_topic
+    answer: str                        # 主答案（rag_answer 时是检索答案；agent_report 时是报告摘要）
+    report: Optional[ConsultReport] = None  # 仅 agent_report 类型时填充
+    bill_elements: Optional[dict] = None    # 若上传了票据文件，此字段包含识别出的要素
+    sources: list[SourceChunk] = []    # RAG 引用来源（仅 rag_answer 时有值）
     retrieval_ms: float = 0.0
     llm_ms: float = 0.0
     total_ms: float = 0.0

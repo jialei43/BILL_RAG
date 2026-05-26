@@ -1,0 +1,646 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>管理后台 — 检索分析</title>
+  <style>
+    :root {
+      --primary:      #1e40af;
+      --primary-light:#3b82f6;
+      --primary-dark: #1e3a8a;
+      --success:      #059669;
+      --warning:      #d97706;
+      --danger:       #dc2626;
+      --info:         #0891b2;
+      --purple:       #7c3aed;
+      --sidebar-w:    240px;
+      --topbar-h:     64px;
+      --bg:           #f1f5f9;
+      --card-bg:      #ffffff;
+      --text:         #1e293b;
+      --text-light:   #64748b;
+      --border:       #e2e8f0;
+      --radius:       12px;
+      --shadow:       0 1px 3px rgba(0,0,0,.08), 0 4px 12px rgba(0,0,0,.04);
+    }
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: 'PingFang SC', 'Helvetica Neue', Arial, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      display: flex;
+      min-height: 100vh;
+    }
+    a { text-decoration: none; color: inherit; }
+    button { cursor: pointer; border: none; outline: none; font-family: inherit; }
+
+    /* ── 侧边栏 ── */
+    .sidebar {
+      width: var(--sidebar-w);
+      background: var(--primary-dark);
+      display: flex;
+      flex-direction: column;
+      position: fixed;
+      top: 0; left: 0; bottom: 0;
+      z-index: 100;
+    }
+    .sidebar-brand {
+      height: var(--topbar-h);
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 0 20px;
+      border-bottom: 1px solid rgba(255,255,255,.1);
+    }
+    .brand-icon {
+      width: 36px; height: 36px;
+      background: var(--primary-light);
+      border-radius: 8px;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 20px;
+    }
+    .brand-text { color: #fff; font-size: 15px; font-weight: 700; }
+    .brand-sub  { color: rgba(255,255,255,.5); font-size: 11px; }
+    .sidebar-nav { flex: 1; padding: 16px 0; overflow-y: auto; }
+    .nav-section-title {
+      color: rgba(255,255,255,.35);
+      font-size: 11px; font-weight: 600;
+      letter-spacing: .08em; text-transform: uppercase;
+      padding: 8px 20px; margin-top: 8px;
+    }
+    .nav-item {
+      display: flex; align-items: center; gap: 10px;
+      padding: 10px 20px;
+      color: rgba(255,255,255,.7);
+      font-size: 14px;
+      transition: background .15s, color .15s;
+      position: relative;
+    }
+    .nav-item:hover { background: rgba(255,255,255,.08); color: #fff; }
+    .nav-item.active { background: rgba(255,255,255,.12); color: #fff; font-weight: 600; }
+    .nav-item.active::before {
+      content: '';
+      position: absolute;
+      left: 0; top: 6px; bottom: 6px;
+      width: 3px;
+      background: var(--primary-light);
+      border-radius: 0 2px 2px 0;
+    }
+    .nav-icon { font-size: 18px; width: 22px; text-align: center; }
+    .sidebar-footer { padding: 16px; border-top: 1px solid rgba(255,255,255,.1); }
+    .user-card {
+      display: flex; align-items: center; gap: 10px;
+      padding: 8px 10px;
+      border-radius: 8px;
+      background: rgba(255,255,255,.06);
+    }
+    .user-avatar {
+      width: 34px; height: 34px; border-radius: 50%;
+      background: var(--primary-light);
+      display: flex; align-items: center; justify-content: center;
+      color: #fff; font-size: 14px; font-weight: 700;
+    }
+    .user-name { color: #fff; font-size: 13px; font-weight: 600; }
+    .user-role { color: rgba(255,255,255,.5); font-size: 11px; }
+    .btn-logout { background: none; padding: 4px; color: rgba(255,255,255,.4); font-size: 16px; transition: color .15s; }
+    .btn-logout:hover { color: rgba(255,255,255,.8); }
+
+    /* ── 主内容 ── */
+    .main-wrap { flex: 1; margin-left: var(--sidebar-w); display: flex; flex-direction: column; min-height: 100vh; }
+    .topbar {
+      height: var(--topbar-h);
+      background: var(--card-bg);
+      border-bottom: 1px solid var(--border);
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 0 28px;
+      position: sticky; top: 0; z-index: 50;
+    }
+    .topbar-title { font-size: 18px; font-weight: 700; }
+    .topbar-right { display: flex; align-items: center; gap: 12px; }
+    .btn-refresh {
+      height: 36px; padding: 0 16px;
+      background: var(--primary); color: #fff;
+      border-radius: 8px; font-size: 13px; font-weight: 600;
+      display: flex; align-items: center; gap: 6px;
+      transition: background .15s;
+    }
+    .btn-refresh:hover { background: var(--primary-light); }
+    .page-content { flex: 1; padding: 28px; }
+    .breadcrumb { font-size: 13px; color: var(--text-light); margin-bottom: 20px; }
+    .breadcrumb span { color: var(--text); font-weight: 500; }
+
+    /* ── 顶部统计卡片 ── */
+    .stats-grid {
+      display: grid;
+      grid-template-columns: repeat(5, 1fr);
+      gap: 16px;
+      margin-bottom: 24px;
+    }
+    .stat-card {
+      background: var(--card-bg);
+      border-radius: var(--radius);
+      padding: 20px;
+      box-shadow: var(--shadow);
+      display: flex; align-items: flex-start; gap: 14px;
+    }
+    .stat-icon {
+      width: 46px; height: 46px; border-radius: 10px;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 22px; flex-shrink: 0;
+    }
+    .stat-icon.blue   { background: #dbeafe; }
+    .stat-icon.green  { background: #d1fae5; }
+    .stat-icon.orange { background: #fef3c7; }
+    .stat-icon.red    { background: #fee2e2; }
+    .stat-icon.purple { background: #ede9fe; }
+    .stat-value { font-size: 26px; font-weight: 800; line-height: 1; margin-bottom: 4px; }
+    .stat-label { font-size: 12px; color: var(--text-light); }
+
+    /* ── 分布图区域 ── */
+    .mid-row {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 20px;
+      margin-bottom: 24px;
+    }
+    .card {
+      background: var(--card-bg);
+      border-radius: var(--radius);
+      box-shadow: var(--shadow);
+      overflow: hidden;
+    }
+    .card-header {
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 16px 20px;
+      border-bottom: 1px solid var(--border);
+    }
+    .card-title { font-size: 14px; font-weight: 700; }
+    .card-body { padding: 20px; }
+
+    /* 比例环形图（纯 CSS） */
+    .donut-wrap {
+      display: flex;
+      align-items: center;
+      gap: 28px;
+    }
+    .donut-svg { flex-shrink: 0; }
+    .donut-legend { display: flex; flex-direction: column; gap: 10px; flex: 1; }
+    .legend-item { display: flex; align-items: center; gap: 8px; font-size: 13px; }
+    .legend-dot { width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0; }
+    .legend-label { color: var(--text-light); flex: 1; }
+    .legend-val { font-weight: 700; }
+    .legend-pct { color: var(--text-light); font-size: 11px; }
+
+    /* 平均耗时条形图 */
+    .timing-bars { display: flex; flex-direction: column; gap: 16px; }
+    .timing-row { display: flex; flex-direction: column; gap: 6px; }
+    .timing-header { display: flex; justify-content: space-between; font-size: 13px; }
+    .timing-label { font-weight: 500; }
+    .timing-val { color: var(--text-light); }
+    .timing-track {
+      height: 10px;
+      background: var(--bg);
+      border-radius: 5px;
+      overflow: hidden;
+    }
+    .timing-fill {
+      height: 100%;
+      border-radius: 5px;
+      transition: width .8s ease;
+    }
+
+    /* ── 查询日志表格 ── */
+    .filter-row {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 14px 20px;
+      border-bottom: 1px solid var(--border);
+    }
+    .filter-row input, .filter-row select {
+      height: 34px;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 0 12px;
+      font-size: 13px;
+      color: var(--text);
+      background: var(--bg);
+    }
+    .filter-row input { flex: 1; }
+    .table-wrap { overflow-x: auto; }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    thead th {
+      background: var(--bg);
+      color: var(--text-light);
+      font-weight: 600;
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: .05em;
+      padding: 10px 14px;
+      text-align: left;
+      border-bottom: 1px solid var(--border);
+      white-space: nowrap;
+    }
+    tbody tr { border-bottom: 1px solid var(--border); transition: background .1s; }
+    tbody tr:last-child { border-bottom: none; }
+    tbody tr:hover { background: #f8fafc; }
+    tbody td { padding: 10px 14px; vertical-align: middle; }
+    .query-text { max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .badge {
+      display: inline-flex; align-items: center; gap: 3px;
+      padding: 2px 8px; border-radius: 20px;
+      font-size: 11px; font-weight: 600; white-space: nowrap;
+    }
+    .badge-specialized  { background: #dbeafe; color: #1e40af; }
+    .badge-fuzzy        { background: #d1fae5; color: #065f46; }
+    .badge-no-result    { background: #fee2e2; color: #7f1d1d; }
+    .badge-other        { background: #f1f5f9; color: #475569; }
+    .badge-success-tag  { background: #d1fae5; color: #065f46; }
+    .badge-fail-tag     { background: #fee2e2; color: #7f1d1d; }
+    .ms-val { font-family: 'SF Mono', monospace; font-size: 12px; color: var(--text-light); }
+
+    /* 星级评分 */
+    .stars { color: #f59e0b; letter-spacing: -2px; }
+
+    /* 空状态 */
+    .empty-state { text-align: center; padding: 40px; color: var(--text-light); }
+    .empty-icon { font-size: 40px; opacity: .4; margin-bottom: 8px; }
+
+    /* loading 骨架 */
+    .skeleton {
+      background: linear-gradient(90deg, #f1f5f9 25%, #e2e8f0 50%, #f1f5f9 75%);
+      background-size: 200% 100%;
+      animation: shimmer 1.4s infinite;
+      border-radius: 6px;
+    }
+    @keyframes shimmer { to { background-position: -200% 0; } }
+
+    /* Toast */
+    #toast-container { position: fixed; top: 20px; right: 20px; z-index: 9999; display: flex; flex-direction: column; gap: 8px; }
+    .toast { background: #1e293b; color: #fff; padding: 10px 18px; border-radius: 8px; font-size: 13px; box-shadow: 0 4px 12px rgba(0,0,0,.25); animation: slideIn .25s ease; }
+    .toast.success { border-left: 4px solid var(--success); }
+    .toast.error   { border-left: 4px solid var(--danger); }
+    @keyframes slideIn { from { transform: translateX(40px); opacity: 0; } to { transform: translateX(0); opacity: 1; } }
+
+    @media (max-width: 1300px) {
+      .stats-grid { grid-template-columns: repeat(3, 1fr); }
+      .mid-row { grid-template-columns: 1fr; }
+    }
+    @media (max-width: 900px) {
+      .stats-grid { grid-template-columns: repeat(2, 1fr); }
+    }
+  </style>
+</head>
+<body>
+
+<!-- ══ 侧边栏 ══ -->
+<aside class="sidebar">
+  <div class="sidebar-brand">
+    <div class="brand-icon">📋</div>
+    <div>
+      <div class="brand-text">票据智能顾问</div>
+      <div class="brand-sub">管理后台</div>
+    </div>
+  </div>
+  <nav class="sidebar-nav">
+    <div class="nav-section-title">核心功能</div>
+    <a href="./index.html" class="nav-item"><span class="nav-icon">📊</span>仪表板</a>
+    <a href="./documents.html" class="nav-item"><span class="nav-icon">📁</span>文档管理</a>
+    <a href="./tenants.html" class="nav-item"><span class="nav-icon">🏢</span>租户管理</a>
+    <a href="./analytics.html" class="nav-item active"><span class="nav-icon">🔍</span>检索分析</a>
+    <div class="nav-section-title">系统</div>
+    <a href="./monitor.html" class="nav-item"><span class="nav-icon">📡</span>系统监控</a>
+    <a href="../chat.html" class="nav-item"><span class="nav-icon">💬</span>用户端聊天</a>
+  </nav>
+  <div class="sidebar-footer">
+    <div class="user-card">
+      <div class="user-avatar" id="user-avatar-text">A</div>
+      <div style="flex:1;min-width:0;">
+        <div class="user-name" id="sidebar-username">管理员</div>
+        <div class="user-role">系统管理员</div>
+      </div>
+      <button class="btn-logout" id="btn-logout" title="退出登录">⎋</button>
+    </div>
+  </div>
+</aside>
+
+<!-- ══ 主内容 ══ -->
+<div class="main-wrap">
+  <header class="topbar">
+    <div class="topbar-title">检索分析</div>
+    <div class="topbar-right">
+      <span style="font-size:12px;color:var(--text-light);">最后刷新：<span id="refresh-time">-</span></span>
+      <button class="btn-refresh" id="btn-refresh">🔄 刷新</button>
+    </div>
+  </header>
+
+  <main class="page-content">
+    <div class="breadcrumb">管理后台 / <span>检索分析</span></div>
+
+    <!-- ── 顶部汇总卡片 ── -->
+    <div class="stats-grid" id="stats-grid">
+      <div class="stat-card"><div class="stat-icon blue">🔍</div><div><div class="skeleton" style="width:60px;height:26px;margin-bottom:6px;"></div><div class="stat-label">总查询次数</div></div></div>
+      <div class="stat-card"><div class="stat-icon green">✅</div><div><div class="skeleton" style="width:60px;height:26px;margin-bottom:6px;"></div><div class="stat-label">检索成功</div></div></div>
+      <div class="stat-card"><div class="stat-icon red">❌</div><div><div class="skeleton" style="width:60px;height:26px;margin-bottom:6px;"></div><div class="stat-label">检索失败</div></div></div>
+      <div class="stat-card"><div class="stat-icon purple">📅</div><div><div class="skeleton" style="width:60px;height:26px;margin-bottom:6px;"></div><div class="stat-label">今日查询</div></div></div>
+      <div class="stat-card"><div class="stat-icon orange">🚫</div><div><div class="skeleton" style="width:60px;height:26px;margin-bottom:6px;"></div><div class="stat-label">无关咨询</div></div></div>
+    </div>
+
+    <!-- ── 2×2 矩阵 + 耗时 ── -->
+    <div class="mid-row">
+
+      <!-- 专项 / 模糊 × 成功 / 失败 矩阵 -->
+      <div class="card">
+        <div class="card-header">
+          <div class="card-title">检索类型 × 结果 分布</div>
+          <span id="matrix-total-tip" style="font-size:12px;color:var(--text-light);"></span>
+        </div>
+        <div class="card-body" id="matrix-body">
+          <div class="skeleton" style="width:100%;height:180px;border-radius:8px;"></div>
+        </div>
+      </div>
+
+      <!-- 平均响应耗时 -->
+      <div class="card">
+        <div class="card-header">
+          <div class="card-title">平均响应耗时（检索成功）</div>
+        </div>
+        <div class="card-body">
+          <div id="timing-bars">
+            <div class="skeleton" style="width:100%;height:40px;border-radius:8px;margin-bottom:12px;"></div>
+            <div class="skeleton" style="width:100%;height:40px;border-radius:8px;"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ── 最近查询日志 ── -->
+    <div class="card">
+      <div class="card-header">
+        <div class="card-title">最近查询日志</div>
+        <span style="font-size:12px;color:var(--text-light);">最近 50 条</span>
+      </div>
+      <div class="filter-row">
+        <input type="text" id="search-input" placeholder="搜索问题内容…" />
+        <select id="route-filter">
+          <option value="">全部类型</option>
+          <option value="specialized_success">专项检索 · 成功</option>
+          <option value="specialized_fail">专项检索 · 失败</option>
+          <option value="fuzzy_success">模糊检索 · 成功</option>
+          <option value="fuzzy_fail">模糊检索 · 失败</option>
+          <option value="off_topic">无关咨询</option>
+        </select>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>用户问题</th>
+              <th>检索类型</th>
+              <th>检索结果</th>
+              <th>意图</th>
+              <th>命中分块</th>
+              <th>检索耗时</th>
+              <th>总耗时</th>
+              <th>时间</th>
+            </tr>
+          </thead>
+          <tbody id="logs-tbody">
+            <tr><td colspan="8"><div class="empty-state"><div class="skeleton" style="width:200px;height:14px;margin:0 auto;"></div></div></td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+  </main>
+</div>
+
+<div id="toast-container"></div>
+
+<script src="../js/config.js?v=2"></script>
+<script src="../js/auth.js?v=2"></script>
+<script src="../js/utils.js?v=2"></script>
+<script src="../js/api.js?v=2"></script>
+
+<script>
+Auth.guardRoute(CONFIG.ROLE.ADMIN);
+
+(function() {
+  const user = Auth.getUser();
+  if (!user) return;
+  const name = user.username || '管理员';
+  document.getElementById('sidebar-username').textContent = name;
+  document.getElementById('user-avatar-text').textContent = name.charAt(0).toUpperCase();
+})();
+document.getElementById('btn-logout').addEventListener('click', () => Auth.logout());
+document.getElementById('btn-refresh').addEventListener('click', loadAll);
+
+let _allLogs = [];
+
+/* ── 过滤器 ── */
+function applyFilter() {
+  const keyword = document.getElementById('search-input').value.trim().toLowerCase();
+  const combo   = document.getElementById('route-filter').value;
+  let list = _allLogs;
+  if (keyword) list = list.filter(l => l.query.toLowerCase().includes(keyword));
+  if (combo) {
+    if (combo === 'off_topic') {
+      list = list.filter(l => l.route_type === 'off_topic');
+    } else {
+      // 'specialized_success' → rt='specialized', result='success'
+      const parts   = combo.split('_');
+      const result  = parts[parts.length - 1];       // 'success' | 'fail'
+      const rt      = parts.slice(0, -1).join('_');  // 'specialized' | 'fuzzy'
+      const hitWanted = result === 'success';
+      list = list.filter(l => l.route_type === rt && l.top_k_hit === hitWanted);
+    }
+  }
+  renderTable(list);
+}
+document.getElementById('search-input').addEventListener('input', applyFilter);
+document.getElementById('route-filter').addEventListener('change', applyFilter);
+
+/* ── 徽章 ── */
+function routeBadge(rt) {
+  if (rt === 'specialized') return '<span class="badge badge-specialized">🎯 专项检索</span>';
+  if (rt === 'off_topic')   return '<span class="badge badge-no-result">🚫 无关咨询</span>';
+  return '<span class="badge badge-fuzzy">🌐 模糊检索</span>';
+}
+function resultBadge(hit, routeType) {
+  if (routeType === 'off_topic') return '<span class="badge badge-other">— 未检索</span>';
+  if (hit === true)  return '<span class="badge badge-success-tag">✅ 成功</span>';
+  if (hit === false) return '<span class="badge badge-fail-tag">❌ 失败</span>';
+  return '<span class="badge badge-other">—</span>';
+}
+
+/* ── 2×2 矩阵 ── */
+function buildMatrix(d) {
+  const ss = d.specialized_success || 0;
+  const sf = d.specialized_fail    || 0;
+  const fs = d.fuzzy_success        || 0;
+  const ff = d.fuzzy_fail           || 0;
+  const sTotal = ss + sf || 1;
+  const fTotal = fs + ff || 1;
+  const retrieval = ss + sf + fs + ff;  // 进入检索流程的查询数（不含无关咨询）
+
+  document.getElementById('matrix-total-tip').textContent =
+    `有效检索 ${retrieval} 条，成功率 ${retrieval > 0 ? Math.round((ss+fs)/retrieval*100) : 0}%`;
+
+  document.getElementById('matrix-body').innerHTML = `
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;">
+
+      <!-- 专项检索 -->
+      <div style="border:1px solid var(--border);border-radius:10px;overflow:hidden;">
+        <div style="background:#dbeafe;padding:10px 14px;font-size:13px;font-weight:700;color:#1e40af;display:flex;justify-content:space-between;">
+          <span>🎯 专项检索</span><span>${ss+sf} 次</span>
+        </div>
+        <div style="padding:12px 14px;display:flex;flex-direction:column;gap:10px;">
+          <div>
+            <div style="display:flex;justify-content:space-between;font-size:13px;margin-bottom:4px;">
+              <span style="color:var(--success);font-weight:600;">✅ 检索成功</span>
+              <span style="font-weight:700;">${ss} <span style="color:var(--text-light);font-weight:400;font-size:11px;">${Math.round(ss/sTotal*100)}%</span></span>
+            </div>
+            <div style="height:8px;background:#f1f5f9;border-radius:4px;overflow:hidden;">
+              <div style="height:100%;background:#059669;border-radius:4px;width:${Math.round(ss/sTotal*100)}%;transition:width .6s;"></div>
+            </div>
+          </div>
+          <div>
+            <div style="display:flex;justify-content:space-between;font-size:13px;margin-bottom:4px;">
+              <span style="color:var(--danger);font-weight:600;">❌ 检索失败</span>
+              <span style="font-weight:700;">${sf} <span style="color:var(--text-light);font-weight:400;font-size:11px;">${Math.round(sf/sTotal*100)}%</span></span>
+            </div>
+            <div style="height:8px;background:#f1f5f9;border-radius:4px;overflow:hidden;">
+              <div style="height:100%;background:#dc2626;border-radius:4px;width:${Math.round(sf/sTotal*100)}%;transition:width .6s;"></div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- 模糊检索 -->
+      <div style="border:1px solid var(--border);border-radius:10px;overflow:hidden;">
+        <div style="background:#d1fae5;padding:10px 14px;font-size:13px;font-weight:700;color:#065f46;display:flex;justify-content:space-between;">
+          <span>🌐 模糊检索</span><span>${fs+ff} 次</span>
+        </div>
+        <div style="padding:12px 14px;display:flex;flex-direction:column;gap:10px;">
+          <div>
+            <div style="display:flex;justify-content:space-between;font-size:13px;margin-bottom:4px;">
+              <span style="color:var(--success);font-weight:600;">✅ 检索成功</span>
+              <span style="font-weight:700;">${fs} <span style="color:var(--text-light);font-weight:400;font-size:11px;">${Math.round(fs/fTotal*100)}%</span></span>
+            </div>
+            <div style="height:8px;background:#f1f5f9;border-radius:4px;overflow:hidden;">
+              <div style="height:100%;background:#059669;border-radius:4px;width:${Math.round(fs/fTotal*100)}%;transition:width .6s;"></div>
+            </div>
+          </div>
+          <div>
+            <div style="display:flex;justify-content:space-between;font-size:13px;margin-bottom:4px;">
+              <span style="color:var(--danger);font-weight:600;">❌ 检索失败</span>
+              <span style="font-weight:700;">${ff} <span style="color:var(--text-light);font-weight:400;font-size:11px;">${Math.round(ff/fTotal*100)}%</span></span>
+            </div>
+            <div style="height:8px;background:#f1f5f9;border-radius:4px;overflow:hidden;">
+              <div style="height:100%;background:#dc2626;border-radius:4px;width:${Math.round(ff/fTotal*100)}%;transition:width .6s;"></div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+    </div>`;
+}
+
+/* ── 耗时图 ── */
+function buildTimingBars(avgR, avgT) {
+  const rPct = Math.min(100, Math.round(avgR / Math.max(avgT, 1) * 100));
+  document.getElementById('timing-bars').innerHTML = `
+    <div class="timing-row">
+      <div class="timing-header">
+        <span class="timing-label">🔍 平均检索耗时</span>
+        <span class="timing-val">${avgR.toFixed(0)} ms</span>
+      </div>
+      <div class="timing-track"><div class="timing-fill" style="width:${rPct}%;background:#3b82f6;"></div></div>
+    </div>
+    <div class="timing-row" style="margin-top:14px;">
+      <div class="timing-header">
+        <span class="timing-label">⚡ 平均总耗时（含 LLM）</span>
+        <span class="timing-val">${(avgT/1000).toFixed(1)} s</span>
+      </div>
+      <div class="timing-track"><div class="timing-fill" style="width:100%;background:#7c3aed;"></div></div>
+    </div>
+    <div style="margin-top:10px;font-size:12px;color:var(--text-light);">
+      检索占总耗时 <strong>${rPct}%</strong>，其余为 LLM 生成耗时
+    </div>`;
+}
+
+/* ── 表格 ── */
+function renderTable(logs) {
+  const $tb = document.getElementById('logs-tbody');
+  if (!logs || logs.length === 0) {
+    $tb.innerHTML = `<tr><td colspan="8"><div class="empty-state"><div class="empty-icon">🔍</div><div>暂无匹配记录</div></div></td></tr>`;
+    return;
+  }
+  $tb.innerHTML = logs.map(l => `
+    <tr>
+      <td><div class="query-text" title="${Utils.escapeHtml(l.query)}">${Utils.escapeHtml(l.query)}</div></td>
+      <td>${routeBadge(l.route_type)}</td>
+      <td>${resultBadge(l.top_k_hit, l.route_type)}</td>
+      <td><span style="font-size:12px;color:var(--text-light);">${l.intent_id || '—'}</span></td>
+      <td style="text-align:center;font-weight:600;${l.chunk_count===0?'color:var(--danger)':''}">${l.chunk_count}</td>
+      <td class="ms-val">${l.retrieval_ms ? l.retrieval_ms.toFixed(0)+' ms' : '—'}</td>
+      <td class="ms-val">${l.total_ms ? (l.total_ms/1000).toFixed(1)+' s' : '—'}</td>
+      <td style="font-size:12px;color:var(--text-light);white-space:nowrap;">${Utils.formatDate(l.created_at, true)}</td>
+    </tr>`).join('');
+}
+
+/* ── 主加载 ── */
+async function loadAll() {
+  document.getElementById('refresh-time').textContent = new Date().toLocaleTimeString('zh-CN');
+  try {
+    const data      = await _req(`${CONFIG.API_BASE}${CONFIG.API_PREFIX}/query/stats`);
+    const total     = data.total     || 0;
+    const success   = data.success   || 0;
+    const fail      = data.fail      || 0;
+    const today     = data.today     || 0;
+    const offTopic  = data.off_topic || 0;
+    const retrieval = total - offTopic;  // 进入检索流程的查询数
+
+    document.getElementById('stats-grid').innerHTML = `
+      <div class="stat-card"><div class="stat-icon blue">🔍</div><div>
+        <div class="stat-value">${Utils.formatNumber(total)}</div><div class="stat-label">总查询次数</div></div></div>
+      <div class="stat-card"><div class="stat-icon green">✅</div><div>
+        <div class="stat-value" style="color:var(--success)">${Utils.formatNumber(success)}</div>
+        <div class="stat-label">检索成功</div>
+        <div style="font-size:11px;color:var(--text-light);margin-top:3px;">成功率 ${retrieval>0?Math.round(success/retrieval*100):0}%</div></div></div>
+      <div class="stat-card"><div class="stat-icon red">❌</div><div>
+        <div class="stat-value" style="color:${fail>0?'var(--danger)':'var(--text)'}">${Utils.formatNumber(fail)}</div>
+        <div class="stat-label">检索失败</div>
+        <div style="font-size:11px;color:var(--text-light);margin-top:3px;">失败率 ${retrieval>0?Math.round(fail/retrieval*100):0}%</div></div></div>
+      <div class="stat-card"><div class="stat-icon purple">📅</div><div>
+        <div class="stat-value">${Utils.formatNumber(today)}</div><div class="stat-label">今日查询</div></div></div>
+      <div class="stat-card"><div class="stat-icon orange">🚫</div><div>
+        <div class="stat-value" style="color:var(--warning)">${Utils.formatNumber(offTopic)}</div>
+        <div class="stat-label">无关咨询</div>
+        <div style="font-size:11px;color:var(--text-light);margin-top:3px;">占比 ${total>0?Math.round(offTopic/total*100):0}%</div></div></div>
+    `;
+
+    buildMatrix(data);
+    buildTimingBars(data.avg_retrieval_ms || 0, data.avg_total_ms || 0);
+    _allLogs = data.recent || [];
+    applyFilter();
+  } catch(e) {
+    Utils.toast('加载失败: ' + e.message, 'error');
+    console.error(e);
+  }
+}
+
+function _req(url) {
+  return fetch(url, { headers: { 'Authorization': `Bearer ${Auth.getToken()}` } })
+    .then(r => {
+      if (r.status === 401) { Auth.logout(); throw new Error('登录已过期'); }
+      if (!r.ok) return r.json().then(e => { throw new Error(e.detail || '请求失败'); });
+      return r.json();
+    });
+}
+
+loadAll();
+</script>
+</body>
+</html>

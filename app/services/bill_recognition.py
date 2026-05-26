@@ -19,6 +19,7 @@ from typing import Optional                # 可选类型标注
 from loguru import logger   # 日志
 
 from config.settings import settings   # 系统配置（视觉模型地址、密钥等）
+from app.core.cache import compute_file_fingerprint  # 文件指纹计算（无 async 依赖）
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -96,6 +97,22 @@ class BillRecognitionService:
 如果图片中没有票据，返回：{"is_bill_found": false}
 所有字段如果在票据上找不到，设置为 null。"""
 
+    def _get_sync_redis(self):
+        """
+        获取同步 Redis 客户端（recognize_file 是同步方法，不能 await 异步客户端）
+        与 rate_limiter 的 Redis 实例独立，避免跨模块共享状态引发竞态。
+        """
+        if not settings.CACHE_ENABLED:
+            return None
+        try:
+            import redis as _redis
+            r = _redis.from_url(settings.REDIS_URL, decode_responses=True,
+                                socket_connect_timeout=1)
+            r.ping()   # 快速验证连接可用（1 秒超时自动失败）
+            return r
+        except Exception:
+            return None   # 连接失败时返回 None，后续缓存操作静默跳过
+
     def recognize_file(self, file_bytes: bytes, filename: str) -> RecognitionResult:
         """
         从上传的文件字节中识别票据要素
@@ -104,6 +121,31 @@ class BillRecognitionService:
         返回：RecognitionResult 包含所有识别到的票据
         """
         t_start = time.perf_counter()   # 记录开始时间，用于计算总耗时
+
+        # ── 缓存查询：同一文件内容只调用一次视觉模型 ─────────────────────────────
+        # 使用文件内容 MD5 作为 Key：相同物理文件 MD5 完全一致
+        file_md5 = compute_file_fingerprint(file_bytes)
+        r = self._get_sync_redis()
+        if r is not None:
+            try:
+                raw = r.get(f"recognition:{file_md5}")
+                if raw:
+                    cached = json.loads(raw)
+                    elapsed_ms = (time.perf_counter() - t_start) * 1000
+                    logger.info(
+                        f"BillRecognition: 缓存命中 md5={file_md5[:8]} "
+                        f"bills={len(cached.get('bills', []))} elapsed_ms={elapsed_ms:.1f}ms(cached)"
+                    )
+                    bills = [BillElement(**b) for b in cached.get("bills", [])]
+                    return RecognitionResult(
+                        bills=bills,
+                        raw_texts=cached.get("raw_texts", []),
+                        elapsed_ms=elapsed_ms,
+                        model_used=cached.get("model_used", settings.VISION_MODEL) + "(cached)",
+                        page_count=cached.get("page_count", 0),
+                    )
+            except Exception as e:
+                logger.debug(f"BillRecognition: 缓存读取跳过: {e}")
 
         suffix = Path(filename).suffix.lower()   # 提取文件后缀（小写），用于类型判断
 
@@ -136,13 +178,36 @@ class BillRecognitionService:
             f"in {len(image_list)} pages, {elapsed_ms:.0f}ms"
         )
 
-        return RecognitionResult(
+        result = RecognitionResult(
             bills=bills,               # 所有识别出的票据
             raw_texts=raw_texts,       # 各页原始文本
             elapsed_ms=round(elapsed_ms, 1),   # 保留 1 位小数
             model_used=settings.VISION_MODEL,  # 记录使用的模型
             page_count=len(image_list),        # 处理的总页数
         )
+
+        # ── 写入识别缓存（识别成功时才缓存，避免缓存空结果）───────────────────────
+        if bills and r is not None:
+            try:
+                import dataclasses
+                cache_data = {
+                    "bills": [
+                        dataclasses.asdict(b) for b in bills   # dataclass 转 dict
+                    ],
+                    "raw_texts": raw_texts,
+                    "model_used": settings.VISION_MODEL,
+                    "page_count": len(image_list),
+                }
+                r.set(
+                    f"recognition:{file_md5}",
+                    json.dumps(cache_data, ensure_ascii=False, default=str),
+                    ex=settings.CACHE_RECOGNITION_TTL,   # TTL=24h
+                )
+                logger.debug(f"BillRecognition: 缓存已写入 md5={file_md5[:8]}")
+            except Exception as e:
+                logger.debug(f"BillRecognition: 缓存写入跳过: {e}")
+
+        return result
 
     def _pdf_to_images(self, pdf_bytes: bytes) -> list[bytes]:
         """

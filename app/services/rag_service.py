@@ -6,6 +6,7 @@
 # 完整流程：
 # 用户问题 → [检索] 找到最相关的文档片段 → [构建Prompt] 把问题+文档拼在一起 → [LLM生成] AI写答案
 
+import re
 import time      # 计时
 import uuid      # 生成唯一 ID
 from typing import AsyncGenerator, Optional  # 异步生成器（用于流式输出）
@@ -18,6 +19,8 @@ from app.services.retrieval_quality import (          # 检索质量评估（P3�
     evaluate, build_transfer_response,
     QUALITY_INSUFFICIENT, QUALITY_PARTIAL, PARTIAL_DISCLAIMER,
 )
+from app.services.metrics import metrics              # Prometheus 监控埋点
+from app.core.cache import bill_cache, compute_query_fingerprint  # 缓存层
 
 
 # ── 票据业务专项系统提示词 ──────────────────────────────────────────────────────
@@ -42,6 +45,39 @@ BILL_SYSTEM_PROMPT = """你是一位专业的票据业务智能顾问，服务�
 6. 回答使用中文，结构清晰，必要时使用列表或表格
 
 注意：不要编造数据或条款，仅基于提供的上下文回答。"""
+
+# 问候词原子集合（用于构建可重复的正则）
+_GW = (
+    "你好|您好|hi|hello|hey|嗨|哈喽|早上好|下午好|晚上好|早安|晚安"
+    "|在吗|在不在|有人吗|请问|能帮我吗|你是谁|你叫什么|你能做什么|你有什么功能"
+    "|帮个忙|问个问题|请教一下|咨询一下|想问问|介绍一下你自己"
+    "|你好啊|你好呀|您好啊|您好呀"
+)
+# 整句仅由一个或多个问候词 + 标点/空白组成，如"您好，请问"也可命中
+_GREETING_PATTERNS = re.compile(
+    rf"^({_GW})([？?！!。,，、\s]+({_GW}))*[？?！!。,，、\s]*$",
+    re.IGNORECASE,
+)
+
+
+_GREETING_REPLY = (
+    "你好！我是票据业务智能顾问，专注于票据贴现、转贴现、质押、托收等全业务链问题。\n\n"
+    "您可以向我咨询：\n"
+    "• 银行承兑汇票 / 商业承兑汇票的识别与合规要求\n"
+    "• 票据贴现、转贴现的操作流程与利率计算\n"
+    "• 票据质押融资的申办条件与风险管理\n"
+    "• 票据背书、托收的规范操作\n"
+    "• 相关监管政策与法规解读\n\n"
+    "请告诉我您想了解的具体问题，我会为您提供专业解答。"
+)
+
+
+def _is_greeting(query: str) -> bool:
+    """检测是否为问候语或无实质内容的泛问（无需检索）"""
+    q = query.strip()
+    if len(q) > 30:  # 超过30字肯定有实质内容
+        return False
+    return bool(_GREETING_PATTERNS.match(q))
 
 
 class RAGService:
@@ -85,6 +121,29 @@ class RAGService:
         t_start = time.perf_counter()   # 记录整体开始时间
         logger.info(f"[rag_query] 开始非流式问答 tenant={tenant_id} query={query[:60]!r}")  # 请求入口
 
+        # ── 问候语/泛问快速返回，跳过检索和 LLM ──────────────────────────────
+        if _is_greeting(query):
+            logger.info(f"[rag_query] 检测到问候/泛问，跳过检索直接回复")
+            return {
+                "query_id": str(uuid.uuid4()),
+                "answer": _GREETING_REPLY,
+                "sources": [],
+                "retrieval_ms": 0.0,
+                "llm_ms": 0.0,
+                "total_ms": round((time.perf_counter() - t_start) * 1000, 1),
+                "retrieved_count": 0,
+            }
+
+        # ── 缓存查询：相同问题相同租户直接返回历史答案 ─────────────────────────
+        query_fp = compute_query_fingerprint(query)
+        cached = await bill_cache.get_rag(tenant_id, query_fp)
+        if cached is not None:
+            cached["query_id"] = str(uuid.uuid4())  # 每次调用返回新 query_id（用于反馈日志）
+            cached["total_ms"] = round((time.perf_counter() - t_start) * 1000, 1)
+            cached["from_cache"] = True
+            logger.info(f"[rag_query] 缓存命中 tenant={tenant_id} fp={query_fp[:8]}")
+            return cached
+
         # ── Step 1: 混合检索 + Reranker 精排 ─────────────────────────────────
         # 从向量库中找到最相关的文档片段
         t0 = time.perf_counter()
@@ -95,6 +154,7 @@ class RAGService:
             rerank_top_n=settings.RERANK_TOP_N,          # 精排后保留数量（默认5个）
         )
         t_retrieval = (time.perf_counter() - t0) * 1000  # 检索耗时（毫秒）
+        metrics.record_retrieval_time(t_retrieval, tenant_id)
         logger.info(f"[rag_query] 检索完成 count={len(retrieved)} retrieval_ms={t_retrieval:.1f}")  # 检索结果
 
         # ── Step 2: 构建上下文（Context）─────────────────────────────────────
@@ -143,61 +203,188 @@ class RAGService:
         answer = await self._generate(user_prompt)  # 调用 LLM 生成答案（异步等待）
         t_llm = (time.perf_counter() - t1) * 1000   # LLM 耗时
         t_total = (time.perf_counter() - t_start) * 1000  # 总耗时
+        metrics.record_llm_time(t_llm, tenant_id)
         logger.info(  # 完整耗时日志
             f"[rag_query] 问答完成 llm_ms={t_llm:.1f} total_ms={t_total:.1f} "
             f"answer_len={len(answer)}"
         )
 
-        # 返回完整结果
-        return {
+        # 构建响应并写入缓存（流式接口不走此路径，所以缓存不影响流式）
+        result = {
             "query_id": str(uuid.uuid4()),         # 本次查询的唯一 ID（用于提交反馈）
             "answer": answer,                      # AI 生成的答案
             "sources": sources,                    # 参考来源列表
+            "route_type": "fuzzy",                 # 旧路径无意图路由，统一归为模糊检索
             "retrieval_ms": round(t_retrieval, 1), # 检索耗时（毫秒，保留1位小数）
             "llm_ms": round(t_llm, 1),             # LLM 生成耗时
             "total_ms": round(t_total, 1),         # 总耗时
             "retrieved_count": len(retrieved),     # 实际检索到的片段数
         }
+        await bill_cache.set_rag(tenant_id, query_fp, result)  # 写入 2h 缓存
+        return result
 
     async def query_stream(
         self,
         tenant_id: str,
         query: str,
+        user_id: str = None,
+        query_id: str = None,
     ) -> AsyncGenerator[str, None]:
         """
         流式问答：像 ChatGPT 一样逐步输出答案
         使用 Python 的 async generator（异步生成器）实现
         每生成一个词/句，就立即发送给客户端，不用等全部生成完才返回
         """
+        import time as _time
+        import uuid as _uuid
+        t_start = _time.perf_counter()
+
         logger.info(f"[rag_stream] 开始检索 tenant={tenant_id} query={query[:60]!r}")  # 检索开始
 
-        # 检索步骤（和非流式版本相同）
+        # 问候语/泛问快速返回（不写日志）
+        if _is_greeting(query):
+            logger.info(f"[rag_stream] 检测到问候/泛问，跳过检索直接回复")
+            yield _GREETING_REPLY
+            return
+
+        # ── 意图路由（与 query_v2 保持一致）──────────────────────────────────
+        intent_id, confidence, classify_method = await intent_router.classify(query)
+        use_specialized = intent_router.should_use_specialized(intent_id, confidence)
+        route_type = "specialized" if use_specialized else "fuzzy"
+        logger.info(
+            f"[rag_stream] 意图识别 intent={intent_id} conf={confidence:.2f} route={route_type}"
+        )
+
+        # ── 无关业务检测：直接返回引导语，不进行任何检索 ─────────────────────
+        if intent_router.is_off_topic(intent_id, query):
+            off_msg = (
+                "您好！我是专注于**票据业务**的智能顾问，您的问题似乎超出了票据业务范畴。\n\n"
+                "我可以为您解答以下方向的问题：\n"
+                "• 银行/商业承兑汇票的识别与合规要求\n"
+                "• 票据贴现、转贴现的流程与利率\n"
+                "• 票据背书、质押融资的规范操作\n"
+                "• 到期追索、拒付处理等风险管理\n"
+                "• 反洗钱、监管合规要求\n\n"
+                "如有票据相关问题欢迎继续咨询！"
+            )
+            yield off_msg
+            t_total = (_time.perf_counter() - t_start) * 1000
+            metrics.record_query(tenant_id, "success")
+            metrics.record_total_time(t_total, tenant_id)
+            _qid = query_id or _uuid.uuid4().hex
+            try:
+                from app.core.database import AsyncSessionLocal
+                async with AsyncSessionLocal() as _db:
+                    await self._log_query(
+                        _db, _qid, tenant_id, user_id, query,
+                        off_msg, [],
+                        0.0, 0.0, t_total, "off_topic", intent_id,
+                        top_k_hit=False,
+                    )
+                    await _db.commit()
+            except Exception as e:
+                logger.warning(f"[rag_stream] off_topic QueryLog 写入失败: {e}")
+            return
+
+        # 专项场景：将意图相关字段注入检索 query 提升召回精准度
+        search_query = self._build_search_query(query, intent_id, None) \
+            if use_specialized else query
+
+        # ── 混合检索 ──────────────────────────────────────────────────────────
+        t1 = _time.perf_counter()
         retrieved = vector_store.hybrid_search(
             tenant_id=tenant_id,
-            query=query,
+            query=search_query,
+            top_k=settings.RETRIEVAL_TOP_K,
+            rerank_top_n=settings.RERANK_TOP_N,
         )
-        logger.info(f"[rag_stream] 检索完成 count={len(retrieved)}")  # 检索结果数量
+        t_retrieval = (_time.perf_counter() - t1) * 1000
+        metrics.record_retrieval_time(t_retrieval, tenant_id)
+        logger.info(f"[rag_stream] 检索完成 count={len(retrieved)}")
 
-        # 构建上下文（和非流式版本相同）
+        # ── 质量评估（与 query_v2 保持一致）──────────────────────────────────
+        quality = evaluate(retrieved)
+        top_k_hit = quality.level != QUALITY_INSUFFICIENT
+        logger.info(
+            f"[rag_stream] 检索质量 level={quality.level} "
+            f"top1={quality.top1_score:.3f} hits={quality.hit_count}"
+        )
+
+        _qid = query_id or _uuid.uuid4().hex
+        sources = [
+            {"content": c["content"][:200], "doc_id": c.get("doc_id"), "score": c.get("score")}
+            for c in retrieved
+        ]
+
+        # ── 检索失败：直接返回转人工提示，不走 LLM ──────────────────────────
+        if not top_k_hit:
+            fail_msg = (
+                "抱歉，当前知识库中暂无足够的内容来准确回答您的问题。\n"
+                "建议您联系专业票据顾问获得进一步支持，或尝试换个方式描述您的问题。"
+            )
+            yield fail_msg
+            t_total = (_time.perf_counter() - t_start) * 1000
+            metrics.record_query(tenant_id, "success")
+            metrics.record_total_time(t_total, tenant_id)
+            try:
+                from app.core.database import AsyncSessionLocal
+                async with AsyncSessionLocal() as _db:
+                    await self._log_query(
+                        _db, _qid, tenant_id, user_id, query,
+                        fail_msg, sources,
+                        t_retrieval, 0.0, t_total, route_type, intent_id,
+                        top_k_hit=False,
+                    )
+                    await _db.commit()
+            except Exception as e:
+                logger.warning(f"[rag_stream] QueryLog(失败) 写入失败: {e}")
+            return
+
+        # ── 检索成功：构建上下文并流式生成 ──────────────────────────────────
         context_parts = []
         for i, chunk in enumerate(retrieved):
             section = f"[{chunk.get('section_path', '')}] " if chunk.get("section_path") else ""
             context_parts.append(
                 f"**参考文档 {i+1}** {section}\n{chunk['content']}"
             )
-
         context = "\n\n---\n\n".join(context_parts)
+
+        if quality.level == QUALITY_PARTIAL:
+            context += f"\n\n{PARTIAL_DISCLAIMER}"
+
         user_prompt = f"## 参考文档\n{context}\n\n## 用户问题\n{query}"
 
-        logger.info(  # LLM 生成开始，记录 provider 方便排查配置问题
+        logger.info(
             f"[rag_stream] 开始 LLM 流式生成 provider={settings.LLM_PROVIDER} "
             f"context_len={len(context)}"
         )
-        token_count = 0  # 统计生成 token 数
+        t2 = _time.perf_counter()
+        token_count = 0
+        answer_parts: list[str] = []
         async for token in self._generate_stream(user_prompt):
-            token_count += 1  # 每 yield 一个 token 计数
-            yield token   # 每次 yield 一小段文字，FastAPI 会立即把它发给客户端
-        logger.info(f"[rag_stream] LLM 生成完毕 token_count={token_count}")  # 生成结束统计
+            token_count += 1
+            answer_parts.append(token)
+            yield token
+        t_llm = (_time.perf_counter() - t2) * 1000
+        t_total = (_time.perf_counter() - t_start) * 1000
+        metrics.record_llm_time(t_llm, tenant_id)
+        metrics.record_total_time(t_total, tenant_id)
+        metrics.record_query(tenant_id, "success")
+        logger.info(f"[rag_stream] LLM 生成完毕 token_count={token_count}")
+
+        # 流结束后写 QueryLog（使用独立 session，避免依赖请求生命周期）
+        try:
+            from app.core.database import AsyncSessionLocal
+            async with AsyncSessionLocal() as _db:
+                await self._log_query(
+                    _db, _qid, tenant_id, user_id, query,
+                    "".join(answer_parts), sources,
+                    t_retrieval, t_llm, t_total, route_type, intent_id,
+                    top_k_hit=True,
+                )
+                await _db.commit()
+        except Exception as e:
+            logger.warning(f"[rag_stream] QueryLog 写入失败: {e}")
 
     async def _generate(self, prompt: str) -> str:
         """
@@ -357,6 +544,17 @@ class RAGService:
 
         logger.info(f"[rag_v2] 开始 tenant={tenant_id} query={query[:60]!r}")
 
+        # ── 缓存查询（query_v2 支持 bill_context，将其纳入指纹避免不同票据命中同一缓存）
+        query_fp = compute_query_fingerprint(query, bill_context)
+        cached_v2 = await bill_cache.get_rag(tenant_id, query_fp)
+        if cached_v2 is not None:
+            cached_v2["query_id"] = query_id   # 替换为本次 query_id
+            cached_v2["query_saved"] = False    # 缓存命中不写日志（避免重复记录）
+            cached_v2["from_cache"] = True
+            cached_v2["total_ms"] = round((time.perf_counter() - t_start) * 1000, 1)
+            logger.info(f"[rag_v2] 缓存命中 tenant={tenant_id} fp={query_fp[:8]}")
+            return cached_v2
+
         # ── F2 Step1：意图识别（两阶段：关键词 → qwen-max）────────────────────
         intent_id, confidence, classify_method = await intent_router.classify(query)
         use_specialized = intent_router.should_use_specialized(intent_id, confidence)
@@ -380,6 +578,7 @@ class RAGService:
             rerank_top_n=settings.RERANK_TOP_N,
         )
         t_retrieval = (time.perf_counter() - t0) * 1000
+        metrics.record_retrieval_time(t_retrieval, tenant_id)
 
         # ── F2 Step4：检索质量评估 ───────────────────────────────────────────
         quality = evaluate(retrieved)
@@ -399,13 +598,15 @@ class RAGService:
                 confidence, classify_method, "no_result",
             )
             resp = build_transfer_response(query, intent_id)
+            t_total_v2 = round((time.perf_counter() - t_start) * 1000, 1)
+            metrics.record_total_time(t_total_v2, tenant_id)
             resp.update({
                 "query_id": query_id,
                 "intent_id": intent_id,
                 "route_type": route_type,
                 "retrieval_ms": round(t_retrieval, 1),
                 "llm_ms": 0.0,
-                "total_ms": round((time.perf_counter() - t_start) * 1000, 1),
+                "total_ms": t_total_v2,
             })
             return resp
 
@@ -427,6 +628,8 @@ class RAGService:
         answer = await self._generate(user_prompt)
         t_llm = (time.perf_counter() - t1) * 1000
         t_total = (time.perf_counter() - t_start) * 1000
+        metrics.record_llm_time(t_llm, tenant_id)
+        metrics.record_total_time(t_total, tenant_id)
 
         # PARTIAL 级别附加免责提示
         if quality.level == QUALITY_PARTIAL:
@@ -445,7 +648,7 @@ class RAGService:
         logger.info(
             f"[rag_v2] 完成 route={route_type} llm_ms={t_llm:.1f} total_ms={t_total:.1f}"
         )
-        return {
+        result_v2 = {
             "query_id": query_id,
             "answer_type": "answer",
             "answer": answer,
@@ -460,6 +663,8 @@ class RAGService:
             "llm_ms": round(t_llm, 1),
             "total_ms": round(t_total, 1),
         }
+        await bill_cache.set_rag(tenant_id, query_fp, result_v2)  # 写入 2h 缓存
+        return result_v2
 
     # ── 内部辅助方法 ──────────────────────────────────────────────────────────
 
@@ -578,7 +783,7 @@ class RAGService:
 
     async def _log_query(self, db, query_id, tenant_id, user_id, query, answer,
                          sources, retrieval_ms, llm_ms, total_ms,
-                         route_type, intent_id) -> None:
+                         route_type, intent_id, top_k_hit: bool = None) -> None:
         """写 QueryLog（P4）。db 为 None 时静默跳过。"""
         if db is None:
             return
@@ -596,6 +801,7 @@ class RAGService:
                 total_ms=total_ms,
                 route_type=route_type,
                 intent_id=intent_id,
+                top_k_hit=top_k_hit,
             )
             db.add(log)
             await db.flush()

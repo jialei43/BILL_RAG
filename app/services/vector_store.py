@@ -38,6 +38,7 @@ _milvus_write_client: Optional["MilvusClient"] = None   # 全局写客户端，�
 
 from config.settings import settings                         # 配置
 from app.services.embedding import embedding_service, bm25_store  # 向量化服务和 BM25 存储
+from app.services.metrics import metrics                          # Prometheus 监控埋点
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -45,51 +46,76 @@ from app.services.embedding import embedding_service, bm25_store  # 向量化服
 # ──────────────────────────────────────────────────────────────────────────────
 def _build_schema() -> "CollectionSchema":
     """
-    定义 Milvus 集合的字段结构
-    类比 SQL：CREATE TABLE bill_documents (id VARCHAR(100) PRIMARY KEY, ...)
+    定义 Milvus 集合 bill_documents 的字段结构。
+    集合说明：
+      - 存储所有租户的文档片段向量，通过 tenant_id 分区键实现物理隔离
+      - 每条记录对应 PostgreSQL document_chunks 表的一行
+      - 支持三路混合检索：稠密向量（语义）+ 稀疏向量（关键词权重）+ BM25（词频）
     """
     fields = [
-        FieldSchema(name="id", dtype=DataType.VARCHAR, max_length=100, is_primary=True),
-        # 主键：片段的唯一 ID（UUID 字符串，最长100字符）
-
-        FieldSchema(name="tenant_id", dtype=DataType.VARCHAR, max_length=50,
-                    is_partition_key=True),
-        # 租户 ID：is_partition_key=True 表示这是分区键
-        # Milvus 会按租户 ID 把数据分散到不同分区，实现物理隔离
-        # 查询时自动过滤，A 租户完全看不到 B 租户的数据
-
-        FieldSchema(name="document_id", dtype=DataType.VARCHAR, max_length=100),
-        # 所属文档 ID（用于按文档删除所有相关向量）
-
-        FieldSchema(name="chunk_index", dtype=DataType.INT64),
-        # 在文档中的块序号（第几块）
-
-        FieldSchema(name="content", dtype=DataType.VARCHAR, max_length=65535),
-        # 文本内容（Milvus VARCHAR 最大 65535 字符）
-
-        FieldSchema(name="section_path", dtype=DataType.VARCHAR, max_length=500),
-        # 章节路径（如"第三条 贴现业务"）
-
-        FieldSchema(name="page_num", dtype=DataType.INT64),
-        # 页码
-
-        FieldSchema(name="chunk_type", dtype=DataType.VARCHAR, max_length=50),
-        # 类型：text/table/image_ocr
-
-        FieldSchema(name="md5_hash", dtype=DataType.VARCHAR, max_length=32),
-        # 文件 MD5（用于幂等检查，防止重复入库）
-
-        FieldSchema(name="dense_vector", dtype=DataType.FLOAT_VECTOR,
-                    dim=settings.MILVUS_DENSE_DIM),
-        # 稠密向量：1024 维浮点数组（BGE-M3 输出）
-
-        FieldSchema(name="sparse_vector", dtype=DataType.SPARSE_FLOAT_VECTOR),
-        # 稀疏向量：{词ID: 权重} 字典（只存非零值，节省空间）
+        FieldSchema(
+            name="id",
+            dtype=DataType.VARCHAR, max_length=100,
+            is_primary=True,
+            description="片段唯一标识，格式为「document_id_chunk_index」，与 PostgreSQL document_chunks.milvus_id 对应"
+        ),
+        FieldSchema(
+            name="tenant_id",
+            dtype=DataType.VARCHAR, max_length=50,
+            is_partition_key=True,
+            description="租户 ID，分区键。Milvus 按此字段将数据路由到不同分区，A 租户完全看不到 B 租户向量"
+        ),
+        FieldSchema(
+            name="document_id",
+            dtype=DataType.VARCHAR, max_length=100,
+            description="所属文档 ID，对应 PostgreSQL documents.id，用于删除文档时批量清除其所有向量"
+        ),
+        FieldSchema(
+            name="chunk_index",
+            dtype=DataType.INT64,
+            description="片段在文档中的序号，从 0 开始，与 PostgreSQL document_chunks.chunk_index 一致"
+        ),
+        FieldSchema(
+            name="content",
+            dtype=DataType.VARCHAR, max_length=65535,
+            description="片段原始文本，检索命中后返回给 LLM 作为上下文，Milvus VARCHAR 上限 65535 字符"
+        ),
+        FieldSchema(
+            name="section_path",
+            dtype=DataType.VARCHAR, max_length=500,
+            description="所属章节路径，如「第三条 贴现业务 > 3.1 申请条件」，用于答案溯源展示"
+        ),
+        FieldSchema(
+            name="page_num",
+            dtype=DataType.INT64,
+            description="片段在原文档中的起始页码，用于引用定位"
+        ),
+        FieldSchema(
+            name="chunk_type",
+            dtype=DataType.VARCHAR, max_length=50,
+            description="片段类型：text=正文段落 / table=表格内容 / image_ocr=图片OCR提取文字"
+        ),
+        FieldSchema(
+            name="md5_hash",
+            dtype=DataType.VARCHAR, max_length=32,
+            description="所属文件的 MD5 哈希值，用于幂等检查：同一文件不重复写入向量"
+        ),
+        FieldSchema(
+            name="dense_vector",
+            dtype=DataType.FLOAT_VECTOR,
+            dim=settings.MILVUS_DENSE_DIM,
+            description=f"BGE-M3 稠密向量，{settings.MILVUS_DENSE_DIM} 维 float32 数组，捕捉语义相似性（如「贴现利率」匹配「折现率」）"
+        ),
+        FieldSchema(
+            name="sparse_vector",
+            dtype=DataType.SPARSE_FLOAT_VECTOR,
+            description="BGE-M3 稀疏向量，{{词ID: 权重}} 稀疏字典，只存非零项，类似 TF-IDF 的关键词权重，精确词语匹配"
+        ),
     ]
     return CollectionSchema(
         fields=fields,
-        description="票据业务智能顾问文档向量库",
-        enable_dynamic_field=True,  # 允许存储 schema 之外的动态字段（灵活扩展）
+        description="票据业务智能顾问文档向量库 — 支持稠密/稀疏/BM25 三路混合检索，按 tenant_id 分区隔离",
+        enable_dynamic_field=True,
     )
 
 
@@ -247,6 +273,15 @@ class VectorStoreService:
         return self._collection
 
     # ── 写入操作 ─────────────────────────────────────────────────────────────
+    @staticmethod
+    def _trunc_bytes(text: str, max_bytes: int) -> str:
+        """按字节截断字符串，同时过滤 \x00 空字节（PDF 解析偶尔引入，Milvus/PG 均不接受）。"""
+        text = text.replace("\x00", "")
+        b = text.encode("utf-8")
+        if len(b) <= max_bytes:
+            return text
+        return b[:max_bytes].decode("utf-8", errors="ignore")
+
     def upsert_chunks(
         self,
         tenant_id: str,
@@ -346,8 +381,8 @@ class VectorStoreService:
             "tenant_id":     [str(tenant_id)] * len(new_chunks),                # 分区键：租户 ID
             "document_id":   [str(document_id)] * len(new_chunks),              # 所属文档 ID
             "chunk_index":   [int(c.chunk_index) for c in new_chunks],          # chunk 序号（Python int）
-            "content":       [str(c.content)[:65530] for c in new_chunks],      # 文本内容，截断到 VARCHAR 上限
-            "section_path":  [str(c.section_path or "")[:498] for c in new_chunks],  # 章节路径，None 安全处理
+            "content":       [self._trunc_bytes(str(c.content), 65500) for c in new_chunks],      # 按字节截断（中文 3 字节/字）
+            "section_path":  [self._trunc_bytes(str(c.section_path or ""), 498) for c in new_chunks],  # 章节路径，按字节截断
             "page_num":      [int(c.page_num) for c in new_chunks],             # 页码（Python int）
             "chunk_type":    [str(c.chunk_type) for c in new_chunks],           # 类型标签
             "md5_hash":      [str(md5_hash)] * len(new_chunks),                 # 文件 MD5
@@ -432,8 +467,12 @@ class VectorStoreService:
         )
         t0 = time.perf_counter()   # 记录检索开始时间
 
-        # ── 向量化查询 ────────────────────────────────────────────────────────
+        # ── 向量化查询（单独计时，用于嵌入推理延迟指标）────────────────────────
+        t_emb_start = time.perf_counter()
         q_emb = embedding_service.encode_query(query)   # 把查询问题转成向量
+        t_embed = (time.perf_counter() - t_emb_start) * 1000
+        metrics.record_embedding_time(t_embed, tenant_id)
+
         dense_vec = q_emb["dense"][0].tolist()          # 取第一个（也是唯一一个）稠密向量
         # 同样需要转换为 Python 原生类型，否则 Milvus 稀疏检索会报类型不匹配
         sparse_vec = {int(k): float(v) for k, v in q_emb["sparse"][0].items() if v > 0}
@@ -495,10 +534,11 @@ class VectorStoreService:
             final = []   # 没有候选结果
 
         t_rerank = (time.perf_counter() - t1) * 1000   # 精排耗时
+        metrics.record_rerank_time(t_rerank, tenant_id)
 
         logger.info(  # 升级为 INFO，检索全链路耗时是关键指标
             f"[vector_store] 混合检索完成 tenant={tenant_id} "
-            f"retrieval={t_retrieval:.1f}ms rerank={t_rerank:.1f}ms "
+            f"embed={t_embed:.1f}ms retrieval={t_retrieval:.1f}ms rerank={t_rerank:.1f}ms "
             f"candidates={len(candidates)} final={len(final)}"
         )
 

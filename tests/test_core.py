@@ -611,7 +611,9 @@ class TestRAGServiceV2:
     def test_f2_insufficient_returns_transfer(self):
         """检索质量不足时应返回 transfer_human 类型"""
         from unittest.mock import AsyncMock
-        with patch("app.services.rag_service.vector_store") as mock_vs, \
+        # 绕过 Redis 缓存：同一查询的历史缓存会遮蔽此测试期望的检索不足路径
+        with patch("app.services.rag_service.bill_cache.get_rag", AsyncMock(return_value=None)), \
+             patch("app.services.rag_service.vector_store") as mock_vs, \
              patch("app.services.rag_service.intent_router") as mock_ir:
             mock_ir.classify = AsyncMock(return_value=("INTENT_EXPIRY", 0.95, "keyword"))
             mock_ir.should_use_specialized.return_value = True

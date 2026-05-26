@@ -104,21 +104,54 @@ class ParsedDocument:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# OCR 引擎（单例：程序只加载一次 PaddleOCR 模型，避免重复占用大量内存）
-# ──────────────────────────────────────────────────────────────────────────────
-_ocr_engine: Optional["PaddleOCR"] = None   # 全局 OCR 引擎实例
+# ── OCR 实例池 ────────────────────────────────────────────────────────────────
+# PaddleOCR 单实例非线程安全（Tensor 状态共享），多线程并发调用会触发
+# "Tensor holds no memory" PreconditionNotMet 错误。
+# 解决方案：预创建 N 个独立实例放入 Queue，并发调用时每线程从池中取一个，
+# 用完归还。允许最多 N 路并发 OCR，且每个实例内部状态完全隔离。
+import threading
+import queue as _queue
 
-def get_ocr_engine() -> "PaddleOCR":
-    """懒加载 PaddleOCR 引擎（第一次调用时初始化，之后复用）"""
-    global _ocr_engine
-    if _ocr_engine is None and PADDLE_AVAILABLE:
-        _ocr_engine = PaddleOCR(
-            use_angle_cls=settings.OCR_USE_ANGLE_CLS,  # 自动检测文字方向并矫正（处理倒置扫描件）
-            lang=settings.OCR_LANG,                    # 识别语言（ch=中文+英文）
-            use_gpu=settings.OCR_USE_GPU,              # 是否用 GPU 加速
-            show_log=False,                            # 不打印 PaddleOCR 内部日志（避免干扰）
-        )
-    return _ocr_engine
+_ocr_pool: "_queue.Queue[PaddleOCR]" = _queue.Queue()
+_ocr_pool_lock = threading.Lock()   # 防止多线程同时初始化池
+_ocr_pool_ready = False             # 标记池是否已初始化
+
+
+def _ensure_ocr_pool():
+    """懒初始化 OCR 实例池（首次调用时创建 OCR_POOL_SIZE 个实例）"""
+    global _ocr_pool_ready
+    if _ocr_pool_ready or not PADDLE_AVAILABLE:
+        return
+    with _ocr_pool_lock:
+        if _ocr_pool_ready:   # double-check
+            return
+        pool_size = settings.OCR_POOL_SIZE
+        logger.info(f"[OCR] 初始化实例池 size={pool_size}，每实例约 600MB 内存")
+        for i in range(pool_size):
+            engine = PaddleOCR(
+                use_angle_cls=settings.OCR_USE_ANGLE_CLS,
+                lang=settings.OCR_LANG,
+                use_gpu=settings.OCR_USE_GPU,
+                show_log=False,
+            )
+            _ocr_pool.put(engine)
+            logger.info(f"[OCR] 实例 {i+1}/{pool_size} 初始化完成")
+        _ocr_pool_ready = True
+        logger.info(f"[OCR] 实例池就绪，支持 {pool_size} 路并发 OCR")
+
+
+class _OcrInstance:
+    """上下文管理器：从池中借出一个 OCR 实例，with 块结束后自动归还"""
+    def __enter__(self) -> "PaddleOCR":
+        _ensure_ocr_pool()
+        if not PADDLE_AVAILABLE or _ocr_pool.empty() and not _ocr_pool_ready:
+            return None
+        self._engine = _ocr_pool.get()   # 阻塞直到有可用实例
+        return self._engine
+
+    def __exit__(self, *_):
+        if hasattr(self, "_engine") and self._engine is not None:
+            _ocr_pool.put(self._engine)  # 归还实例到池中
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -387,13 +420,12 @@ class VisionTableExtractor:
             import numpy as np
             from PIL import Image   # PIL：Python 图像处理库
 
-            ocr = get_ocr_engine()
-            if ocr is None:
-                return ""
-
             img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
             # BytesIO：把字节流转为"像文件一样"的对象；convert("RGB")：确保是 RGB 格式（非 RGBA）
-            result = ocr.ocr(np.array(img), cls=settings.OCR_USE_ANGLE_CLS)
+            with _OcrInstance() as ocr:   # 从实例池借出，支持并发
+                if ocr is None:
+                    return ""
+                result = ocr.ocr(np.array(img), cls=settings.OCR_USE_ANGLE_CLS)
             # np.array(img)：PIL 图片转 NumPy 数组（OCR 需要这种格式）
 
             if not result or not result[0]:
@@ -605,17 +637,16 @@ class BillPDFParser:
             pix = page.get_pixmap(matrix=mat)   # 渲染页面为像素图
             img_bytes = pix.tobytes("png")      # 转为 PNG 格式的字节数据
 
-            ocr = get_ocr_engine()
-            if ocr is None:
-                return ""
-
             import numpy as np
             from PIL import Image
 
             img = Image.open(io.BytesIO(img_bytes))  # 字节 → PIL 图片
             img_arr = np.array(img)                  # PIL 图片 → NumPy 数组
 
-            result = ocr.ocr(img_arr, cls=settings.OCR_USE_ANGLE_CLS)
+            with _OcrInstance() as ocr:   # 从实例池借出，支持并发
+                if ocr is None:
+                    return ""
+                result = ocr.ocr(img_arr, cls=settings.OCR_USE_ANGLE_CLS)
             # cls=True：开启文字方向分类（能处理旋转90°、180°的文字）
 
             if not result or not result[0]:
@@ -652,17 +683,16 @@ class BillPDFParser:
             with open(file_path, "rb") as f:   # rb=二进制读取
                 img_bytes = f.read()            # 读取整个图片文件
 
-            ocr = get_ocr_engine()
-            if ocr is None:
-                return ParsedDocument(elements=[], total_pages=1, file_type="image")
-
             import numpy as np
             from PIL import Image
 
             img = Image.open(io.BytesIO(img_bytes)).convert("RGB")  # 打开图片并转为 RGB
             img_arr = np.array(img)
 
-            result = ocr.ocr(img_arr, cls=True)   # 执行 OCR（cls=True 开启方向矫正）
+            with _OcrInstance() as ocr:   # 从实例池借出，支持并发
+                if ocr is None:
+                    return ParsedDocument(elements=[], total_pages=1, file_type="image")
+                result = ocr.ocr(img_arr, cls=True)   # 执行 OCR（cls=True 开启方向矫正）
             text_lines = []
             if result and result[0]:
                 for line in result[0]:

@@ -56,3 +56,10 @@ passlib[bcrypt]==1.7.4
 bcrypt==4.0.1
 numpy==1.26.4
 pandas==2.2.2
+reportlab==4.2.2
+
+# MCP & LangGraph（多智能体企业级执行引擎）
+mcp[cli]>=1.0.0                         # Model Context Protocol Python SDK（FastMCP 工具封装与 HTTP 挂载）
+langgraph>=0.2.0                        # LangGraph 多 Agent 状态图框架（替代自定义 DAGExecutor）
+langchain-core>=0.3.0                   # LangGraph 依赖的核心抽象层
+langgraph-checkpoint-postgres>=0.1.0    # PostgreSQL 检查点持久化（多容器状态外置）

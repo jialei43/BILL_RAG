@@ -40,12 +40,22 @@ class Settings(BaseSettings):
     MILVUS_NLIST: int = 128                        # IVF 索引的聚类数量，影响检索速度和精度的平衡
 
     # ── Redis 缓存配置 ─────────────────────────────────────────────────────────
-    # Redis 是内存数据库，用于：限流计数、BM25索引缓存、文档计数
+    # Redis 是内存数据库，用于：限流计数、BM25索引缓存、文档计数、业务结果缓存
     REDIS_URL: str = "redis://localhost:6379/0"    # Redis 连接地址，/0 表示使用第 0 号数据库
-    REDIS_CACHE_TTL: int = 3600                    # 缓存过期时间：3600秒=1小时，到期自动清除
+    REDIS_CACHE_TTL: int = 3600                    # 通用缓存过期时间（旧字段，保留兼容）
     TENANT_QPS_LIMIT: int = 20                     # 每个租户每秒最多发 20 个请求（防止滥用）
     TENANT_QPS_WINDOW: int = 60                    # 限流滑动窗口大小：60秒内统计请求数
     TENANT_DOC_QUOTA: int = 10000                  # 每个租户最多上传 10000 个文档（防止存储爆炸）
+
+    # ── 业务缓存 TTL 配置（各层缓存过期时间）────────────────────────────────────
+    # 设计原则：结果越稳定 TTL 越长；依赖实时数据（黑名单/法规）的 TTL 较短
+    CACHE_ENABLED: bool = True                     # 全局缓存开关（False=完全禁用，用于调试）
+    CACHE_AUDIT_TTL: int = 14400                   # 审核任务级缓存：4 小时（工作日内结果可复用）
+    CACHE_COMPLIANCE_TTL: int = 21600              # 合规 RAG 检索缓存：6 小时（法规白天不变）
+    CACHE_FRAUD_TTL: int = 7200                    # 欺诈检测缓存：2 小时（黑名单可能更新）
+    CACHE_RAG_TTL: int = 7200                      # RAG 问答缓存：2 小时（知识库短期稳定）
+    CACHE_INTENT_TTL: int = 86400                  # 意图识别缓存：24 小时（同问题意图不变）
+    CACHE_RECOGNITION_TTL: int = 86400             # 票据图片识别缓存：24 小时（文件内容不变）
 
     # ── 向量嵌入模型配置 ──────────────────────────────────────────────────────
     # 这些模型把文字转换成数字向量，让计算机能"理解"文本语义
@@ -74,6 +84,7 @@ class Settings(BaseSettings):
     OCR_USE_ANGLE_CLS: bool = True        # 自动纠正倾斜：扫描件歪了也能正确识别
     OCR_DPI_SCALE: int = 2               # 图像放大倍数：放大 2 倍后再识别，提高准确率
     OCR_USE_GPU: bool = False             # 是否使用 GPU 加速 OCR（没有 GPU 就用 CPU）
+    OCR_POOL_SIZE: int = 5               # OCR 实例池大小：允许 N 路并发，每实例约 600MB 内存
 
     # ── PDF 解析配置 ──────────────────────────────────────────────────────────
     PDF_RESOLUTION_SCALE: int = 2                  # PDF 渲染分辨率倍数

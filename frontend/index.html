@@ -1,0 +1,553 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>票据智能顾问 — 登录</title>
+
+  <!-- Google Fonts：Noto Sans SC 中英文混排字体 -->
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@300;400;500;600;700&display=swap" rel="stylesheet" />
+
+  <style>
+    /* ── CSS 变量：统一配色 ─────────────────────────────────────────── */
+    :root {
+      --primary:       #1e40af;    /* 主色：深蓝，金融行业稳重感 */
+      --primary-light: #3b82f6;    /* 浅蓝：用于悬停、焦点 */
+      --primary-dark:  #1e3a8a;    /* 深蓝：按钮按下 */
+      --gold:          #b45309;    /* 金色：强调品牌 */
+      --gold-light:    #f59e0b;    /* 浅金：装饰线 */
+      --bg:            #f0f4f8;    /* 页面背景：浅灰蓝 */
+      --surface:       #ffffff;    /* 卡片背景：纯白 */
+      --border:        #e2e8f0;    /* 边框色 */
+      --text:          #1e293b;    /* 主文字：深灰 */
+      --text-muted:    #64748b;    /* 次要文字：中灰 */
+      --success:       #059669;    /* 成功绿 */
+      --danger:        #dc2626;    /* 危险红 */
+    }
+
+    /* ── 全局重置 ──────────────────────────────────────────────────── */
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body {
+      height: 100%;
+      font-family: 'Noto Sans SC', 'PingFang SC', 'Microsoft YaHei', sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      font-size: 14px;
+      line-height: 1.6;
+    }
+
+    /* ── 页面布局：左图右表单 ───────────────────────────────────────── */
+    .page-wrapper {
+      min-height: 100vh;
+      display: flex;
+    }
+
+    /* 左侧品牌区 */
+    .brand-panel {
+      flex: 1;                                   /* 占剩余空间 */
+      background: linear-gradient(135deg, #1e3a8a 0%, #1e40af 50%, #0369a1 100%);
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      align-items: center;
+      padding: 48px;
+      position: relative;
+      overflow: hidden;
+    }
+    /* 背景装饰圆圈 */
+    .brand-panel::before {
+      content: '';
+      position: absolute;
+      width: 500px; height: 500px;
+      border-radius: 50%;
+      background: rgba(255,255,255,.05);
+      top: -150px; right: -100px;
+    }
+    .brand-panel::after {
+      content: '';
+      position: absolute;
+      width: 300px; height: 300px;
+      border-radius: 50%;
+      background: rgba(255,255,255,.04);
+      bottom: -80px; left: -60px;
+    }
+
+    .brand-logo {
+      font-size: 48px;                           /* Logo Emoji 大小 */
+      margin-bottom: 24px;
+      position: relative; z-index: 1;
+    }
+    .brand-name {
+      font-size: 28px; font-weight: 700;
+      color: #fff;
+      margin-bottom: 8px;
+      position: relative; z-index: 1;
+    }
+    .brand-tagline {
+      font-size: 14px; color: rgba(255,255,255,.75);
+      text-align: center; line-height: 1.8;
+      position: relative; z-index: 1;
+    }
+    .brand-features {
+      margin-top: 48px; list-style: none;
+      position: relative; z-index: 1;
+    }
+    .brand-features li {
+      color: rgba(255,255,255,.85);
+      font-size: 14px;
+      padding: 8px 0;
+      display: flex; align-items: center; gap: 10px;
+    }
+    .brand-features li::before {
+      content: '';
+      width: 6px; height: 6px; border-radius: 50%;
+      background: var(--gold-light);
+      flex-shrink: 0;
+    }
+
+    /* 右侧表单区 */
+    .form-panel {
+      width: 480px;                              /* 固定宽度 */
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      padding: 48px 56px;
+      background: var(--surface);
+    }
+
+    .form-header { margin-bottom: 32px; }
+    .form-header h1 {
+      font-size: 26px; font-weight: 700;
+      color: var(--text); margin-bottom: 6px;
+    }
+    .form-header p { font-size: 14px; color: var(--text-muted); }
+
+    /* ── 角色切换 ──────────────────────────────────────────────────── */
+    .role-switcher {
+      display: flex;
+      background: var(--bg);
+      border-radius: 10px;
+      padding: 4px;
+      margin-bottom: 28px;
+      position: relative;
+    }
+    .role-btn {
+      flex: 1;
+      padding: 10px 0;
+      border: none;
+      background: transparent;
+      border-radius: 8px;
+      font-size: 14px; font-weight: 500;
+      color: var(--text-muted);
+      cursor: pointer;
+      transition: all .2s;
+      position: relative; z-index: 1;
+    }
+    .role-btn.active {
+      color: var(--primary);
+      background: var(--surface);
+      box-shadow: 0 1px 3px rgba(0,0,0,.12), 0 1px 2px rgba(0,0,0,.08);
+    }
+    /* 角色提示徽章 */
+    .role-hint {
+      display: flex; align-items: flex-start; gap: 10px;
+      background: #eff6ff;                      /* 浅蓝背景 */
+      border: 1px solid #bfdbfe;
+      border-radius: 8px;
+      padding: 12px 14px;
+      margin-bottom: 24px;
+      font-size: 13px; color: #1d4ed8;
+      line-height: 1.5;
+    }
+    .role-hint-icon { font-size: 16px; flex-shrink: 0; margin-top: 1px; }
+
+    /* ── 表单组件 ──────────────────────────────────────────────────── */
+    .form-group { margin-bottom: 20px; }
+    .form-label {
+      display: block;
+      font-size: 13px; font-weight: 500;
+      color: var(--text); margin-bottom: 7px;
+    }
+    .form-input {
+      width: 100%;
+      padding: 11px 14px;
+      border: 1.5px solid var(--border);
+      border-radius: 8px;
+      font-size: 14px;
+      color: var(--text);
+      background: var(--surface);
+      outline: none;
+      transition: border-color .2s, box-shadow .2s;
+      font-family: inherit;
+    }
+    .form-input:focus {
+      border-color: var(--primary-light);
+      box-shadow: 0 0 0 3px rgba(59,130,246,.15);
+    }
+    .form-input.error { border-color: var(--danger); }
+
+    /* 密码输入框容器（带显示/隐藏按钮） */
+    .input-wrapper { position: relative; }
+    .input-wrapper .form-input { padding-right: 44px; }
+    .toggle-password {
+      position: absolute; right: 12px; top: 50%;
+      transform: translateY(-50%);
+      background: none; border: none; cursor: pointer;
+      color: var(--text-muted); font-size: 16px; padding: 4px;
+    }
+    .toggle-password:hover { color: var(--text); }
+
+    /* 错误文字 */
+    .field-error {
+      font-size: 12px; color: var(--danger);
+      margin-top: 5px; display: none;
+    }
+    .field-error.show { display: block; }
+
+    /* 全局错误提示框 */
+    .alert-error {
+      background: #fef2f2; border: 1px solid #fecaca;
+      border-radius: 8px; padding: 12px 14px;
+      font-size: 13px; color: #b91c1c;
+      margin-bottom: 20px; display: none;
+      align-items: flex-start; gap: 8px;
+    }
+    .alert-error.show { display: flex; }
+
+    /* ── 提交按钮 ──────────────────────────────────────────────────── */
+    .btn-login {
+      width: 100%;
+      padding: 13px;
+      background: var(--primary);
+      color: #fff;
+      border: none; border-radius: 8px;
+      font-size: 15px; font-weight: 600;
+      cursor: pointer;
+      transition: background .2s, transform .1s;
+      display: flex; align-items: center; justify-content: center; gap: 8px;
+      font-family: inherit;
+    }
+    .btn-login:hover { background: var(--primary-light); }
+    .btn-login:active { background: var(--primary-dark); transform: scale(.99); }
+    .btn-login:disabled { background: #94a3b8; cursor: not-allowed; transform: none; }
+
+    /* 加载动画圆圈 */
+    .spinner {
+      width: 16px; height: 16px;
+      border: 2px solid rgba(255,255,255,.3);
+      border-top-color: #fff;
+      border-radius: 50%;
+      animation: spin .6s linear infinite;
+      display: none;
+    }
+    .spinner.show { display: block; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    /* ── 页脚 ──────────────────────────────────────────────────────── */
+    .form-footer {
+      margin-top: 32px;
+      text-align: center;
+      font-size: 12px; color: var(--text-muted);
+    }
+
+    /* ── 响应式：小屏隐藏品牌区 ────────────────────────────────────── */
+    @media (max-width: 768px) {
+      .brand-panel { display: none; }
+      .form-panel { width: 100%; padding: 32px 24px; }
+    }
+  </style>
+</head>
+
+<body>
+<div class="page-wrapper">
+
+  <!-- ══ 左侧品牌区 ══════════════════════════════════════════════════════════ -->
+  <div class="brand-panel">
+    <div class="brand-logo">🏦</div>
+    <div class="brand-name">票据业务智能顾问</div>
+    <p class="brand-tagline">
+      面向持牌票据经纪机构及银行票据部门<br />
+      企业级智能问答与分析平台
+    </p>
+    <ul class="brand-features">
+      <li>混合检索：BGE-M3 + BM25 + Reranker 精排</li>
+      <li>多模态解析：PDF / Word / Excel / 扫描件 OCR</li>
+      <li>多租户隔离：零跨租户数据泄露</li>
+      <li>票据要素识别：一键提取关键字段</li>
+      <li>全链路可观测：Prometheus + Grafana</li>
+    </ul>
+  </div>
+
+  <!-- ══ 右侧登录表单区 ══════════════════════════════════════════════════════ -->
+  <div class="form-panel">
+    <div class="form-header">
+      <h1>欢迎登录</h1>
+      <p>请选择账号类型后输入凭据</p>
+    </div>
+
+    <!-- 角色切换按钮 -->
+    <div class="role-switcher" role="tablist" aria-label="选择登录类型">
+      <button
+        class="role-btn active"
+        id="btn-user"
+        role="tab"
+        aria-selected="true"
+        onclick="switchRole('user')"
+      >
+        👤 用户账号
+      </button>
+      <button
+        class="role-btn"
+        id="btn-admin"
+        role="tab"
+        aria-selected="false"
+        onclick="switchRole('admin')"
+      >
+        🔧 管理员账号
+      </button>
+    </div>
+
+    <!-- 角色说明提示框（动态内容） -->
+    <div class="role-hint" id="role-hint" aria-live="polite">
+      <span class="role-hint-icon">ℹ️</span>
+      <span id="role-hint-text">
+        用户账号：可使用智能问答功能和票据要素识别服务
+      </span>
+    </div>
+
+    <!-- 全局错误提示 -->
+    <div class="alert-error" id="alert-error" role="alert">
+      <span>⚠️</span>
+      <span id="alert-msg"></span>
+    </div>
+
+    <!-- 登录表单 -->
+    <form id="login-form" onsubmit="handleLogin(event)" novalidate>
+
+      <!-- 用户名 -->
+      <div class="form-group">
+        <label class="form-label" for="username">用户名</label>
+        <input
+          type="text"
+          id="username"
+          name="username"
+          class="form-input"
+          placeholder="请输入用户名"
+          autocomplete="username"
+          required
+          autofocus
+        />
+        <p class="field-error" id="err-username">请输入用户名</p>
+      </div>
+
+      <!-- 密码 -->
+      <div class="form-group">
+        <label class="form-label" for="password">密码</label>
+        <div class="input-wrapper">
+          <input
+            type="password"
+            id="password"
+            name="password"
+            class="form-input"
+            placeholder="请输入密码"
+            autocomplete="current-password"
+            required
+          />
+          <!-- 显示/隐藏密码切换 -->
+          <button
+            type="button"
+            class="toggle-password"
+            onclick="togglePassword()"
+            aria-label="显示或隐藏密码"
+          >
+            <span id="eye-icon">👁</span>
+          </button>
+        </div>
+        <p class="field-error" id="err-password">请输入密码</p>
+      </div>
+
+      <!-- 提交按钮 -->
+      <button type="submit" class="btn-login" id="btn-submit">
+        <div class="spinner" id="spinner"></div>
+        <span id="btn-text">登 录</span>
+      </button>
+
+    </form>
+
+    <!-- 页脚版权 -->
+    <div class="form-footer">
+      © 2026 票据业务智能顾问 · 企业版 v1.0<br />
+      <span style="font-size:11px">仅限授权用户使用</span>
+    </div>
+  </div>
+</div>
+
+<!-- ── 依赖脚本（顺序加载） ─────────────────────────────────────────────── -->
+<script src="./js/config.js?v=2"></script>
+<script src="./js/auth.js?v=2"></script>
+<script src="./js/utils.js?v=2"></script>
+
+<script>
+  /* 清理旧格式缓存（is_admin → role 迁移） */
+  (function() {
+    try {
+      const raw = localStorage.getItem(CONFIG.USER_KEY);
+      if (raw) {
+        const u = JSON.parse(raw);
+        if ('is_admin' in u && !('role' in u)) {
+          localStorage.removeItem(CONFIG.USER_KEY);
+          localStorage.removeItem(CONFIG.TOKEN_KEY);
+        }
+      }
+    } catch(e) {}
+  })();
+
+  /* ── 当前选中的角色（默认用户） ──────────────────────────────────────────── */
+  let currentRole = CONFIG.ROLE.USER;
+
+  /* 角色提示文案 */
+  const ROLE_HINTS = {
+    [CONFIG.ROLE.USER]:  '用户账号：可使用智能问答功能和票据要素识别服务',
+    [CONFIG.ROLE.ADMIN]: '管理员账号：可管理知识库文档、租户配置及系统监控',
+  };
+
+  /**
+   * 切换角色：更新 UI 状态和提示文案
+   * @param {'user'|'admin'} role
+   */
+  function switchRole(role) {
+    currentRole = role;                                   // 更新当前角色变量
+
+    // 更新切换按钮样式
+    document.getElementById('btn-user').classList.toggle('active', role === CONFIG.ROLE.USER);
+    document.getElementById('btn-admin').classList.toggle('active', role === CONFIG.ROLE.ADMIN);
+
+    // 更新提示文案
+    document.getElementById('role-hint-text').textContent = ROLE_HINTS[role];
+
+    // 清除错误状态
+    hideError();
+    clearFieldErrors();
+  }
+
+  /**
+   * 切换密码显示/隐藏
+   */
+  function togglePassword() {
+    const input = document.getElementById('password');
+    const icon  = document.getElementById('eye-icon');
+    if (input.type === 'password') {
+      input.type = 'text';
+      icon.textContent = '🙈';                            // 隐藏状态图标
+    } else {
+      input.type = 'password';
+      icon.textContent = '👁';                            // 显示状态图标
+    }
+  }
+
+  /**
+   * 显示全局错误提示
+   * @param {string} msg
+   */
+  function showError(msg) {
+    const el = document.getElementById('alert-error');
+    document.getElementById('alert-msg').textContent = msg;
+    el.classList.add('show');
+  }
+
+  function hideError() {
+    document.getElementById('alert-error').classList.remove('show');
+  }
+
+  /**
+   * 清除所有字段级别错误
+   */
+  function clearFieldErrors() {
+    document.querySelectorAll('.field-error').forEach(e => e.classList.remove('show'));
+    document.querySelectorAll('.form-input').forEach(e => e.classList.remove('error'));
+  }
+
+  /**
+   * 显示字段错误
+   * @param {string} fieldId - input 的 id
+   * @param {string} errId   - 错误提示元素的 id
+   */
+  function showFieldError(fieldId, errId) {
+    document.getElementById(fieldId).classList.add('error');
+    document.getElementById(errId).classList.add('show');
+  }
+
+  /**
+   * 表单提交处理
+   * @param {Event} e
+   */
+  async function handleLogin(e) {
+    e.preventDefault();                                   // 阻止默认提交
+
+    hideError();
+    clearFieldErrors();
+
+    const username = document.getElementById('username').value.trim();
+    const password = document.getElementById('password').value;
+
+    // 前端表单验证
+    let hasError = false;
+    if (!username) { showFieldError('username', 'err-username'); hasError = true; }
+    if (!password) { showFieldError('password', 'err-password'); hasError = true; }
+    if (hasError) return;
+
+    // 禁用按钮 + 显示加载动画
+    const btn     = document.getElementById('btn-submit');
+    const spinner = document.getElementById('spinner');
+    const btnText = document.getElementById('btn-text');
+    btn.disabled = true;
+    spinner.classList.add('show');
+    btnText.textContent = '登录中...';
+
+    try {
+      const result = await Auth.login(username, password, currentRole);  // 调用认证模块
+
+      if (!result.success) {
+        showError(result.error);                          // 显示后端返回的错误
+        return;
+      }
+
+      // 登录成功：根据角色跳转
+      if (result.role === CONFIG.ROLE.ADMIN) {
+        window.location.href = CONFIG.ROUTES.ADMIN_DASHBOARD;  // 管理后台
+      } else {
+        window.location.href = CONFIG.ROUTES.CHAT;             // 用户聊天页
+      }
+
+    } catch (err) {
+      showError(err.message || '登录失败，请重试');
+    } finally {
+      // 恢复按钮状态（登录成功时页面跳转，以下代码不会执行）
+      btn.disabled = false;
+      spinner.classList.remove('show');
+      btnText.textContent = '登 录';
+    }
+  }
+
+  /* 页面加载时：若已登录则直接跳转，无需重复登录 */
+  window.addEventListener('DOMContentLoaded', () => {
+    if (Auth.isAuthenticated()) {
+      const role = Auth.getRole();
+      if (role === CONFIG.ROLE.ADMIN) {
+        window.location.href = CONFIG.ROUTES.ADMIN_DASHBOARD;
+      } else {
+        window.location.href = CONFIG.ROUTES.CHAT;
+      }
+    }
+  });
+
+  /* 回车键提交 */
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && e.target.tagName !== 'TEXTAREA') {
+      document.getElementById('login-form').requestSubmit();
+    }
+  });
+</script>
+</body>
+</html>

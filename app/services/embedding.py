@@ -14,6 +14,13 @@ from typing import Optional  # 可选类型
 import numpy as np           # NumPy：科学计算库，向量运算的核心工具
 from loguru import logger    # 日志
 
+# tqdm >= 4.66 移除了 tqdm.tqdm._lock，但 FlagEmbedding 内部仍直接访问它
+# 在导入 FlagEmbedding 前补丁，避免 "has no attribute '_lock'" 报错
+import tqdm as _tqdm_pkg
+if not hasattr(_tqdm_pkg.tqdm, '_lock'):
+    import threading
+    _tqdm_pkg.tqdm._lock = threading.RLock()
+
 # 尝试导入 FlagEmbedding（BGE-M3 模型库），不存在时优雅降级
 try:
     from FlagEmbedding import BGEM3FlagModel, FlagReranker
@@ -76,42 +83,54 @@ def tokenize_chinese(text: str) -> list[str]:
 # ──────────────────────────────────────────────────────────────────────────────
 # BGE-M3 模型（单例模式：整个程序只加载一次，避免重复占用大量内存）
 # ──────────────────────────────────────────────────────────────────────────────
+import threading as _threading
+
 _bge_model: Optional["BGEM3FlagModel"] = None   # 全局变量，存储已加载的模型实例
 _reranker: Optional["FlagReranker"] = None       # 全局变量，存储已加载的精排模型实例
+_bge_model_lock = _threading.Lock()             # 防止多线程同时触发懒加载（2GB 模型只能串行初始化）
+_reranker_lock  = _threading.Lock()
+_encode_lock    = _threading.Lock()             # 串行化 encode()：CPU 推理多线程并发反而互相竞争慢，串行更高效
 
 
 def get_bge_model() -> "BGEM3FlagModel":
     """
     懒加载 BGE-M3 模型（第一次调用时才加载，之后复用）
-    模型文件约 2GB，加载一次需要几十秒，所以不能每次请求都加载
+    使用双重检查锁（double-checked locking）：外层 if 避免每次都抢锁（已加载后无开销），
+    内层 if 防止多个线程同时通过外层检查后重复初始化。
     """
-    global _bge_model                            # 声明操作全局变量
-    if _bge_model is None and FLAGEMB_AVAILABLE: # 还没加载且库已安装
-        logger.info(f"Loading BGE-M3 from {settings.BGE_M3_MODEL_PATH}")
-        try:
-            _bge_model = BGEM3FlagModel(
-                settings.BGE_M3_MODEL_PATH,      # 模型路径（本地路径或 HuggingFace ID）
-                use_fp16=True,                   # 使用半精度浮点数（节省一半显存，速度更快）
-            )
-            logger.info("[embedding] BGE-M3 模型加载成功")  # 加载成功，确认模型就绪
-        except Exception as e:
-            logger.error(f"[embedding] BGE-M3 模型加载失败: {e}", exc_info=True)  # 含堆栈方便定位路径/显存问题
+    global _bge_model
+    if _bge_model is None and FLAGEMB_AVAILABLE:
+        with _bge_model_lock:
+            if _bge_model is None:               # 二次确认：防止排队等锁的线程重复加载
+                logger.info(f"Loading BGE-M3 from {settings.BGE_M3_MODEL_PATH}")
+                try:
+                    _bge_model = BGEM3FlagModel(
+                        settings.BGE_M3_MODEL_PATH,
+                        use_fp16=False,          # macOS MPS FP16 会触发 Metal 断言崩溃，强制 CPU FP32
+                        device="cpu",            # 强制 CPU，避免 Apple MPS datatype mismatch
+                    )
+                    logger.info("[embedding] BGE-M3 模型加载成功")
+                except Exception as e:
+                    logger.error(f"[embedding] BGE-M3 模型加载失败: {e}", exc_info=True)
     return _bge_model
 
 
 def get_reranker() -> "FlagReranker":
-    """懒加载 BGE-Reranker 精排模型"""
+    """懒加载 BGE-Reranker 精排模型（同样使用双重检查锁）"""
     global _reranker
     if _reranker is None and FLAGEMB_AVAILABLE:
-        logger.info(f"Loading BGE-Reranker from {settings.BGE_RERANKER_MODEL_PATH}")
-        try:
-            _reranker = FlagReranker(
-                settings.BGE_RERANKER_MODEL_PATH,
-                use_fp16=True,                   # 半精度，节省资源
-            )
-            logger.info("[embedding] BGE-Reranker 模型加载成功")  # 加载成功确认
-        except Exception as e:
-            logger.error(f"[embedding] BGE-Reranker 模型加载失败: {e}", exc_info=True)  # 含堆栈
+        with _reranker_lock:
+            if _reranker is None:
+                logger.info(f"Loading BGE-Reranker from {settings.BGE_RERANKER_MODEL_PATH}")
+                try:
+                    _reranker = FlagReranker(
+                        settings.BGE_RERANKER_MODEL_PATH,
+                        use_fp16=False,          # macOS MPS FP16 崩溃，强制 CPU FP32
+                        device="cpu",
+                    )
+                    logger.info("[embedding] BGE-Reranker 模型加载成功")
+                except Exception as e:
+                    logger.error(f"[embedding] BGE-Reranker 模型加载失败: {e}", exc_info=True)
     return _reranker
 
 
@@ -310,21 +329,23 @@ class EmbeddingService:
         all_dense = []    # 收集所有批次的稠密向量
         all_sparse = []   # 收集所有批次的稀疏向量
 
-        # 分批处理（避免一次性把所有文本都塞进模型，导致内存/显存溢出）
-        for i in range(0, len(texts), batch_size):
-            batch = texts[i : i + batch_size]   # 切出当前批次（切片操作）
-            batch_no = i // batch_size + 1      # 当前批次编号（从1开始）
-            logger.debug(  # 批次进度：用于定位哪个批次卡住或报错
-                f"[embedding] 向量化 batch {batch_no}/{total_batches} size={len(batch)}"
-            )
-            output = model.encode(
-                batch,
-                return_dense=True,          # 返回稠密向量（语义嵌入）
-                return_sparse=True,         # 返回稀疏向量（词语权重）
-                return_colbert_vecs=False,  # 不返回 ColBERT 向量（节省计算）
-            )
-            all_dense.append(output["dense_vecs"])     # 当前批次的稠密向量
-            all_sparse.extend(output["lexical_weights"])  # 当前批次的稀疏权重
+        # _encode_lock 保证同一时刻只有一个线程调用 model.encode()
+        # CPU 推理本身已用满所有核心，多线程并发只会互相竞争 PyTorch 内部线程池导致死锁
+        with _encode_lock:
+            for i in range(0, len(texts), batch_size):
+                batch = texts[i : i + batch_size]
+                batch_no = i // batch_size + 1
+                logger.debug(
+                    f"[embedding] 向量化 batch {batch_no}/{total_batches} size={len(batch)}"
+                )
+                output = model.encode(
+                    batch,
+                    return_dense=True,
+                    return_sparse=True,
+                    return_colbert_vecs=False,
+                )
+                all_dense.append(output["dense_vecs"])
+                all_sparse.extend(output["lexical_weights"])
 
         # 把所有批次的稠密向量拼接成一个大数组
         dense = np.vstack(all_dense).astype(np.float32)
@@ -376,8 +397,9 @@ class EmbeddingService:
         # 构建 (问题, 候选文档) 配对列表
         pairs = [(query, c) for c in candidates]  # 每个候选都和问题配成一对
 
-        # 精排模型计算每对的相关性分数
-        scores = reranker.compute_score(pairs, normalize=True)
+        # 精排模型计算每对的相关性分数（同样串行化，避免并发调用 reranker）
+        with _encode_lock:
+            scores = reranker.compute_score(pairs, normalize=True)
         # normalize=True：把分数归一化到 [0, 1] 区间
 
         # 按分数从高到低排序，返回 (原始索引, 分数) 对
@@ -386,7 +408,7 @@ class EmbeddingService:
         result = [(idx, float(score)) for idx, score in indexed[:top_n]]
         logger.info(  # 精排完成：记录最高分和最低分，方便判断精排效果
             f"[embedding] 精排完成 returned={len(result)} "
-            f"top_score={result[0][1]:.4f if result else 0}"
+            f"top_score={(result[0][1] if result else 0):.4f}"
         )
         return result  # 只取前 top_n 个，转换为 Python float 类型
 

@@ -2,6 +2,10 @@
 # 这是整个 Web 服务的"大门"——FastAPI 应用的主入口文件
 # 负责：启动/关闭初始化、注册路由、添加中间件、处理全局异常
 
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
 import os                                # Python 标准库，用于设置进程级环境变量
 import time                              # Python 标准库，用于计时（记录每个请求的处理时长）
 import uuid                              # 生成唯一请求 ID，用于全链路日志追踪
@@ -15,10 +19,12 @@ from fastapi import FastAPI, Request        # FastAPI：Web 框架主类；Reque
 from fastapi.middleware.cors import CORSMiddleware   # CORS 中间件：允许跨域请求（前端调用后端时需要）
 from fastapi.middleware.gzip import GZipMiddleware   # GZip 中间件：自动压缩响应体，节省带宽
 from fastapi.responses import JSONResponse           # 用于返回 JSON 格式的响应
+from fastapi.staticfiles import StaticFiles          # 静态文件服务：将前端 HTML/CSS/JS 托管到 API 服务器
 from loguru import logger                            # loguru：更好用的日志库，比 print 更专业
 
 from config.settings import settings                 # 导入全局配置对象
 from app.core.logging import setup_logging, contextualize  # 生产级日志配置
+from app.core.tracing import trace_id_middleware     # Trace ID 中间件（多容器可观测性）
 
 # 日志系统必须在所有模块导入之前初始化，确保第三方库的 stdlib logging 也被拦截
 setup_logging()
@@ -31,6 +37,11 @@ from app.api.routers import (
     bill_router,                              # 票据要素识别路由（独立接口，不写库）
     bills_router,                             # 票据生命周期路由（入库+流转+查询）
 )
+from app.core.cache import bill_cache  # 业务缓存实例（lifespan 关闭时断开连接）
+# 多智能体系统路由（M9~M10 阶段新增）
+from app.api.audit_router import audit_router       # 审核任务路由：提交/查询/报告下载
+from app.api.batch_router import batch_router       # 批量审核路由：批次提交/进度查询/子项列表
+from app.api.tracking_router import tracking_router  # 流转追踪路由：创建追踪/查询状态/报文详情
 
 
 # ── 启动 / 关闭生命周期管理 ────────────────────────────────────────────────────
@@ -57,11 +68,42 @@ async def lifespan(app: FastAPI):
     else:
         logger.warning("⚠️ Milvus 未连接，向量检索不可用")  # 连接失败时发出警告，系统仍可运行（只是无法检索）
 
+    # 第四步：初始化 LangGraph PostgresSaver（创建检查点表结构）
+    # 多容器部署时，每个容器共享同一 PostgreSQL 的 checkpoints 表
+    logger.info("初始化 LangGraph PostgresSaver（检查点持久化）...")
+    try:
+        from app.graph import setup_checkpointer
+        await setup_checkpointer()                     # 幂等操作：表已存在时跳过建表
+    except Exception as e:
+        logger.warning(f"⚠️ LangGraph 检查点初始化失败（不影响服务启动）: {e}")
+
+    # 第五步：初始化 MCP Server（注册所有工具）
+    # 导入 server.py 触发所有 @mcp.tool() 装饰器的工具注册
+    logger.info("初始化 MCP Server（注册工具）...")
+    try:
+        from app.mcp.server import mcp as _mcp        # 触发所有工具的注册（副作用导入）
+        logger.info(f"MCP Server 已就绪，共注册工具：{len(list(_mcp._tool_manager._tools))} 个")
+    except Exception as e:
+        logger.warning(f"⚠️ MCP Server 初始化失败（不影响其他服务）: {e}")
+
+    # 第六步：预热业务缓存 Redis 连接（懒加载，首次 get/set 时才真正建连接）
+    # 这里只记录日志，实际连接在第一次缓存操作时建立
+    from config.settings import settings as _s
+    logger.info(f"业务缓存已配置 redis={_s.REDIS_URL} enabled={_s.CACHE_ENABLED}")
+
     logger.info("✅ 系统启动完成")
     yield   # 程序运行阶段：yield 之后暂停，等待应用正常运行……
 
     # yield 之后的代码：应用关闭时执行（相当于"关门前的收尾工作"）
     logger.info("🛑 系统关闭")
+    # 关闭 LangGraph PostgresSaver 连接池（释放 psycopg3 连接，避免连接泄漏）
+    try:
+        from app.graph import teardown_checkpointer
+        await teardown_checkpointer()
+    except Exception as e:
+        logger.warning(f"⚠️ LangGraph 连接池关闭失败: {e}")
+    # 关闭业务缓存 Redis 连接（释放连接池资源，避免 TCP 连接泄漏）
+    await bill_cache.close()
 
 
 # ── 创建 FastAPI 应用实例 ─────────────────────────────────────────────────────
@@ -104,6 +146,11 @@ app.add_middleware(
 app.add_middleware(GZipMiddleware, minimum_size=1000)
 
 
+# Trace ID 中间件：为每个请求绑定追踪 ID，写入响应头（多容器日志聚合关键）
+# 支持外部传入 X-Trace-ID（API 网关/上游服务透传）或自动生成
+app.middleware("http")(trace_id_middleware)
+
+
 # 自定义中间件：给每个响应添加"处理时间"响应头
 @app.middleware("http")                    # 装饰器：注册为 HTTP 中间件
 async def add_process_time_header(request: Request, call_next):
@@ -129,7 +176,7 @@ async def log_requests(request: Request, call_next):
 # 当任何地方抛出未捕获的异常时，统一在这里处理，避免把错误堆栈直接暴露给用户
 @app.exception_handler(Exception)         # 捕获所有 Exception 类型的异常
 async def global_exception_handler(request: Request, exc: Exception):
-    logger.error(f"Unhandled exception: {exc}", exc_info=True)  # 在日志中记录完整错误信息
+    logger.exception(f"Unhandled exception: {type(exc).__name__}")  # 在日志中记录完整错误信息
     return JSONResponse(
         status_code=500,                  # HTTP 500 = 服务器内部错误
         content={"success": False, "error": "内部服务器错误", "detail": str(exc)},
@@ -148,6 +195,28 @@ app.include_router(tenant_router, prefix=API_PREFIX)  # 租户管理接口：/ap
 app.include_router(bill_router, prefix=API_PREFIX)    # 票据识别接口：/api/v1/bill-recognition/...
 app.include_router(bills_router, prefix=API_PREFIX)   # 票据生命周期接口：/api/v1/bills/...
 app.include_router(metrics_router)                    # 监控指标接口：/metrics、/health（无前缀）
+
+# 多智能体系统路由（M9~M10 阶段新增）
+app.include_router(audit_router,    prefix=API_PREFIX)    # 审核任务接口：/api/v1/audit/...
+app.include_router(batch_router,    prefix=API_PREFIX)    # 批量任务接口：/api/v1/batch/...
+app.include_router(tracking_router, prefix=API_PREFIX)    # 流转追踪接口：/api/v1/tracking/...
+
+# MCP Server 挂载：将 MCP 作为 ASGI 子应用挂载到 /mcp 路径
+# POST /mcp   → MCP 协议请求（initialize / list_tools / call_tool）
+# GET  /mcp/sse → SSE 事件流（Streamable HTTP 模式）
+# 外部 LLM（Claude API / Claude Desktop）通过此端点调用票据审核工具
+try:
+    from app.mcp.server import get_mcp_asgi_app
+    app.mount("/mcp", get_mcp_asgi_app())              # 挂载 MCP Streamable HTTP ASGI 应用
+    logger.info("MCP Server 已挂载到 /mcp")
+except Exception as e:
+    logger.warning(f"⚠️ MCP Server 挂载失败: {e}")
+
+# 前端静态文件托管：将 frontend/ 目录挂载到 /frontend 路径
+# 访问 http://localhost:8000/frontend/index.html 即可打开登录页
+_FRONTEND_DIR = Path(__file__).parent.parent / "frontend"
+if _FRONTEND_DIR.exists():
+    app.mount("/frontend", StaticFiles(directory=str(_FRONTEND_DIR), html=True), name="frontend")
 
 
 # 根路径接口：访问 http://localhost:8000/ 时返回的欢迎信息
@@ -168,7 +237,7 @@ if __name__ == "__main__":
     uvicorn.run(
         "app.main:app",                   # 指定要运行的 FastAPI 应用（模块路径:变量名）
         host="0.0.0.0",                   # 监听所有网卡（0.0.0.0 表示外网也能访问）
-        port=8000,                        # 监听 8000 端口
+        port=8002,                        # 监听 8000 端口
         reload=settings.DEBUG,            # 调试模式下开启热重载（改代码自动重启，不用手动）
         workers=1 if settings.DEBUG else 4,  # 调试时 1 个进程，生产时 4 个进程并发处理请求
         log_level="debug" if settings.DEBUG else "info",  # 日志详细程度

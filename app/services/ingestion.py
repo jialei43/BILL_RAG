@@ -129,12 +129,13 @@ class IngestionPipeline:
         )
         metrics.record_embedding_time(vector_ms, tenant_id)  # 上报向量化耗时
 
-        # ── 更新配额计数 ──────────────────────────────────────────────────────
+        # ── 更新配额计数 + Prometheus 文档数 Gauge ────────────────────────────
         if inserted > 0:                          # 有实际写入（不是重复文档）
             new_count = rate_limiter.increment_doc_count(tenant_id)  # Redis 中的文档计数 +1
-            logger.info(f"[ingestion] 配额计数更新 tenant={tenant_id} new_count={new_count}")  # 方便对账配额使用量
+            metrics.set_doc_count(tenant_id, new_count)              # 更新文档数 Gauge
+            logger.info(f"[ingestion] 配额计数更新 tenant={tenant_id} new_count={new_count}")
         else:
-            logger.info(f"[ingestion] 重复文档跳过计数更新 tenant={tenant_id} doc={document_id}")  # 幂等入库不计数
+            logger.info(f"[ingestion] 重复文档跳过计数更新 tenant={tenant_id} doc={document_id}")
 
         # ── 计算全程耗时并打印汇总日志 ────────────────────────────────────────
         total_ms = (time.perf_counter() - t_start) * 1000
@@ -153,6 +154,15 @@ class IngestionPipeline:
         ])
         metrics.record_table_extraction(total_tables, tenant_id)  # 上报表格数量
 
+        # 统计 OCR 处理页数
+        ocr_pages = stats.get("ocr_pages", 0) or stats.get("scanned_pages", 0)
+        if ocr_pages > 0:
+            metrics.record_ocr_processed(ocr_pages, tenant_id)
+
+        # 更新 chunk 总数 Gauge（本次成功写入的 chunk 数）
+        if inserted > 0:
+            metrics.set_chunk_count(tenant_id, len(chunks))
+
         # ── 入库成功：删除 checkpoint 文件，释放磁盘空间 ─────────────────────────
         # 只有全流程（解析 + 向量化 + Milvus 写入）都成功后才删除
         # 如果此行之前任何步骤失败（抛出异常），checkpoint 会被保留，下次重试可复用
@@ -168,6 +178,19 @@ class IngestionPipeline:
             "parse_stats": parsed_doc.parse_stats,
             "elapsed_ms": round(total_ms, 1),
             "status": "completed" if inserted > 0 else "duplicate",
+            # _chunks 供 _update_doc_status 写入 PostgreSQL document_chunks 表
+            # 仅新文档写入（inserted>0），重复文档已有记录，跳过
+            "_chunks": [
+                {
+                    "chunk_index": c.chunk_index,
+                    "content": c.content,
+                    "section_path": c.section_path,
+                    "page_num": c.page_num,
+                    "chunk_type": c.chunk_type,
+                    "token_count": c.token_count,
+                }
+                for c in chunks
+            ] if inserted > 0 else [],
         }
 
     def delete_document(self, tenant_id: str, document_id: str):

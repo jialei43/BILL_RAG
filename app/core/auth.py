@@ -35,9 +35,23 @@ oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/v1/auth/login")
 
 class TokenData(BaseModel):
     """JWT Token 解码后的数据结构（Token 携带的用户信息）"""
-    user_id: str           # 用户唯一 ID
-    tenant_id: str         # 用户所属租户 ID（用于数据隔离，防止 A 公司看到 B 公司的数据）
-    is_admin: bool = False # 是否是管理员（默认不是）
+    user_id: str                # 用户唯一 ID
+    tenant_id: str              # 用户所属租户 ID
+    role: str = "user"          # 角色：super_admin / tenant_admin / user
+
+    # ── 便捷属性（供路由层判断权限，无需直接比较字符串）──────────────────────
+    @property
+    def is_super_admin(self) -> bool:
+        return self.role == "super_admin"
+
+    @property
+    def is_tenant_admin_or_above(self) -> bool:
+        return self.role in ("super_admin", "tenant_admin")
+
+    @property
+    def is_admin(self) -> bool:
+        """向后兼容：仅超级管理员拥有跨租户可见性，租户管理员视为普通租户内成员。"""
+        return self.role == "super_admin"
 
 
 class Token(BaseModel):
@@ -113,7 +127,7 @@ def decode_token(token: str) -> TokenData:
         return TokenData(
             user_id=user_id,
             tenant_id=tenant_id,
-            is_admin=payload.get("is_admin", False),  # 取出管理员标志，默认 False
+            role=payload.get("role", "user"),
         )
     except JWTError as e:                              # Token 签名错误或已过期
         logger.warning(f"[auth] Token 解码失败: {e}")  # 记录具体原因（过期/签名错/格式错）
@@ -133,15 +147,25 @@ async def get_current_user(token: str = Depends(oauth2_scheme)) -> TokenData:
 
 
 async def get_admin_user(current_user: TokenData = Depends(get_current_user)) -> TokenData:
-    """
-    FastAPI 依赖函数：验证当前用户是管理员
-    在需要管理员权限的路由上使用 Depends(get_admin_user)
-    如果不是管理员，返回 403 禁止访问
-    """
-    if not current_user.is_admin:                     # 检查管理员标志
-        logger.warning(  # 非管理员访问管理接口，记录 user_id 方便安全审计
-            f"[auth] 非管理员尝试访问管理接口 user_id={current_user.user_id} "
-            f"tenant_id={current_user.tenant_id}"
+    """向后兼容别名 → 等同于 get_super_admin。"""
+    return await get_super_admin(current_user)
+
+
+async def get_super_admin(current_user: TokenData = Depends(get_current_user)) -> TokenData:
+    """仅超级管理员可访问（全局唯一，跨租户管理）。"""
+    if not current_user.is_super_admin:
+        logger.warning(
+            f"[auth] 非超级管理员访问超管接口 user_id={current_user.user_id} role={current_user.role}"
         )
-        raise HTTPException(status_code=403, detail="需要管理员权限")  # 403 = 禁止访问
-    return current_user                               # 是管理员，放行并返回用户信息
+        raise HTTPException(status_code=403, detail="需要超级管理员权限")
+    return current_user
+
+
+async def get_tenant_admin_or_above(current_user: TokenData = Depends(get_current_user)) -> TokenData:
+    """租户管理员或超级管理员可访问（文档管理、用户管理等）。"""
+    if not current_user.is_tenant_admin_or_above:
+        logger.warning(
+            f"[auth] 普通用户访问管理接口 user_id={current_user.user_id} role={current_user.role}"
+        )
+        raise HTTPException(status_code=403, detail="需要租户管理员或以上权限")
+    return current_user
