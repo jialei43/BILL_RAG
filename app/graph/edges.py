@@ -22,6 +22,17 @@ from app.graph.state import BillAuditState               # 图状态类型
 # 通用关键节点：parse 和 extract 在所有业务类型中都是关键节点
 # ──────────────────────────────────────────────────────────────────────────────
 
+"""
+FULL_AUDIT        = "full_audit"         # 全流程审核：依次执行所有 12 个 Agent
+    ISSUANCE_CHECK    = "issuance_check"     # 出票合规预检：仅执行出票相关子集
+    DISCOUNT_APPLY    = "discount_apply"     # 贴现申请审核：侧重合同审核 + 贸易背景
+    ACCEPTANCE_PROMPT = "acceptance_prompt"  # 提示承兑：侧重背书链 + 承兑行资质
+    ENDORSEMENT       = "endorsement"        # 背书转让：侧重背书连续性核查
+    PAYMENT_PROMPT    = "payment_prompt"     # 提示付款：到期要素 + 账户校验
+    PLEDGE            = "pledge"             # 质押背书：法律要素 + 质押登记
+    COLLECTION        = "collection"         # 托收委托：委托链 + 资金流向
+"""
+
 def after_parse(state: BillAuditState) -> str:
     """
     文档解析节点完成后的路由
