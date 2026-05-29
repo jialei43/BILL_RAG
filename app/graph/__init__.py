@@ -59,6 +59,44 @@ async def setup_checkpointer() -> AsyncPostgresSaver:
     await _pool.open()                                   # 建立连接池（异步初始化连接）
 
     # 将连接池注入 AsyncPostgresSaver（内部所有操作都从池中借用连接）
+    """
+     AsyncPostgresSaver 是 LangGraph 提供的异步检查点（Checkpoint）持久化器，核心作用是把 LangGraph
+  工作流的中间状态保存到 PostgreSQL 数据库中。
+
+  ---
+  它解决什么问题
+  
+  LangGraph 的 Graph（状态机）在执行时会产生一系列"状态快照"。默认情况下这些状态只存在内存里，进程重启或多实例部署时
+  就丢失了。AsyncPostgresSaver 把这些快照持久化到 PostgreSQL，从而支持：
+
+  - 多容器/多进程部署：不同实例共享同一个会话状态
+  - 断点续跑：某个节点失败后可以从上一个检查点恢复，不必从头跑
+  - 会话历史：同一 thread_id 的多轮对话状态可以跨请求保持
+
+  ---
+  它在你项目里的工作流程
+  
+  请求进来
+     ↓
+  从连接池借一个 pg 连接（AsyncConnectionPool）
+     ↓
+  AsyncPostgresSaver 读取 checkpoints 表中该 thread_id 的最新状态
+     ↓
+  LangGraph 继续/开始执行 Graph 节点
+     ↓
+  每个节点执行完 → AsyncPostgresSaver 把新状态 JSON 写回 checkpoints 表
+     ↓
+  连接归还连接池
+
+  你项目的初始化代码在 app/graph/__init__.py:62：
+
+  _checkpointer = AsyncPostgresSaver(_pool)   # 注入连接池
+  await _checkpointer.setup()                  # 自动建 checkpoints 表（幂等）
+
+  然后在 builder.py:296 构建 Graph 时把它传进去，LangGraph 框架自动负责读写，业务代码无需手动调用。
+
+
+    """
     _checkpointer = AsyncPostgresSaver(_pool)
 
     # 执行建表操作（创建 checkpoints / checkpoint_blobs / checkpoint_writes 三张表）

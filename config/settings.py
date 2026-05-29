@@ -43,6 +43,7 @@ class Settings(BaseSettings):
     # Redis 是内存数据库，用于：限流计数、BM25索引缓存、文档计数、业务结果缓存
     REDIS_URL: str = "redis://localhost:6379/0"    # Redis 连接地址，/0 表示使用第 0 号数据库
     REDIS_CACHE_TTL: int = 3600                    # 通用缓存过期时间（旧字段，保留兼容）
+    SHARED_DATA_TTL: int = 3600                    # MCP 跨服务 shared_data 缓存过期时间（秒）
     TENANT_QPS_LIMIT: int = 20                     # 每个租户每秒最多发 20 个请求（防止滥用）
     TENANT_QPS_WINDOW: int = 60                    # 限流滑动窗口大小：60秒内统计请求数
     TENANT_DOC_QUOTA: int = 10000                  # 每个租户最多上传 10000 个文档（防止存储爆炸）
@@ -119,6 +120,9 @@ class Settings(BaseSettings):
     LOG_ROTATION: str = "50 MB"          # 单文件超过 50MB 时自动轮转
     LOG_RETENTION: str = "30 days"       # 保留最近 30 天的日志，更早的自动删除
     LOG_COMPRESSION: str = "gz"          # 轮转后用 gzip 压缩，节省磁盘空间
+
+    # ── MCP 独立部署配置 ──────────────────────────────────────────────────────
+    MCP_SERVER_URL: str = "http://localhost:8001/mcp"  # 独立 MCP Server 地址（主应用通过此地址调用工具）
 
     # ── 监控配置 ──────────────────────────────────────────────────────────────
     PROMETHEUS_ENABLED: bool = True       # 是否开启 Prometheus 监控数据采集

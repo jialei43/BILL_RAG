@@ -38,6 +38,7 @@ class ElementExtractionAgent(BaseAgent):
         db: AsyncSession,
         file_bytes: Optional[bytes] = None,  # 文件字节（优先使用，避免重复读磁盘）
         filename: Optional[str] = None,      # 文件名（用于 BillRecognitionService）
+        file_path: Optional[str] = None,     # 文件路径（fallback：节点从 BillAuditState 传入）
         **kwargs
     ) -> AgentResult:
         """
@@ -60,7 +61,7 @@ class ElementExtractionAgent(BaseAgent):
 
         # 步骤 1：获取文件字节（优先使用传入参数，否则查库）
         resolved_bytes, resolved_filename = await self._resolve_file_bytes(
-            ctx, db, file_bytes, filename
+            ctx, db, file_bytes, filename, file_path
         )
         if resolved_bytes is None:
             return AgentResult(
@@ -169,10 +170,10 @@ class ElementExtractionAgent(BaseAgent):
             agent_name=self.agent_name,
             success=True,
             data={
+                **ctx.shared_data["bill_element"],   # 完整 18 字段，供 LangGraph node 写回 state
                 "element_id":    element_id,
-                "ticket_number": bill.ticket_number,
-                "confidence":    confidence,
                 "low_confidence": confidence < self.CONFIDENCE_WARNING_THRESHOLD,
+                "source":        "vision_llm",
             },
         )
 
@@ -186,20 +187,22 @@ class ElementExtractionAgent(BaseAgent):
         db: AsyncSession,
         file_bytes: Optional[bytes],
         filename: Optional[str],
+        file_path: Optional[str] = None,
     ):
         """
         获取文件字节内容
-        优先使用传入参数，否则从 shared_data（DocumentParserAgent 已读取）或数据库路径读取
+        优先级：file_bytes > file_path kwarg > parsed_doc["file_path"] > document_id 查库
         """
         if file_bytes is not None:
-            return file_bytes, filename or "document.pdf"  # 直接使用传入的字节
+            return file_bytes, filename or "document.pdf"
 
-        # 尝试从 shared_data 的 parsed_doc 中获取文件信息（DocumentParserAgent 已先执行）
-        parsed_doc = ctx.shared_data.get("parsed_doc")
-        resolved_path = None
+        resolved_path = file_path  # 直接使用传入的路径（LangGraph 节点传入）
 
-        if parsed_doc and "file_path" in parsed_doc:
-            resolved_path = parsed_doc["file_path"]
+        # 次选：从 shared_data 的 parsed_doc 读取（DocumentParserAgent 已先执行的场景）
+        if resolved_path is None:
+            parsed_doc = ctx.shared_data.get("parsed_doc")
+            if parsed_doc and "file_path" in parsed_doc:
+                resolved_path = parsed_doc["file_path"]
 
         # 从数据库 documents 表查询文件路径
         if resolved_path is None and ctx.document_id:
@@ -400,11 +403,10 @@ class ElementExtractionAgent(BaseAgent):
             agent_name=self.agent_name,
             success=True,
             data={
+                **ctx.shared_data["bill_element"],   # 完整 18 字段，供 LangGraph node 写回 state
                 "element_id":     element_id,
-                "ticket_number":  pre.get("ticket_number"),
-                "confidence":     confidence,
                 "low_confidence": confidence < self.CONFIDENCE_WARNING_THRESHOLD,
-                "source":         "prefilled",  # 告知调用方本次走的是预填充路径
+                "source":         "prefilled",
             },
         )
 

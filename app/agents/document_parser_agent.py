@@ -82,7 +82,7 @@ class DocumentParserAgent(BaseAgent):
             )
 
         # 步骤 6：将解析结果写入 shared_data，后续的 ElementExtractionAgent 从此读取
-        doc_dict = self._to_dict(parsed_doc)    # 转换为可序列化的字典格式
+        doc_dict = self._to_dict(parsed_doc, file_path=resolved_path)  # 携带文件路径
         doc_dict["confidence"] = confidence      # 附加置信度字段（并非原始 ParsedDocument 的字段）
         ctx.shared_data["parsed_doc"] = doc_dict  # 写入共享上下文
 
@@ -169,15 +169,16 @@ class DocumentParserAgent(BaseAgent):
         # 兜底：无置信度信息时返回 1.0（假设解析完全成功）
         return 1.0
 
-    def _to_dict(self, parsed_doc) -> dict:
+    def _to_dict(self, parsed_doc, file_path: str = None) -> dict:
         """
         将 ParsedDocument 转换为可序列化的字典格式
-        供 shared_data 存储和后续 Agent 读取
+        供 shared_data 存储和后续 Agent（ElementExtractionAgent）读取
         """
         return {
+            "file_path":   file_path,   # 供 ElementExtractionAgent._resolve_file_bytes() 使用
             "elements": [
                 {
-                    "text":    elem.text,
+                    "text":    elem.content,
                     "type":    elem.element_type,
                     "metadata": elem.metadata,
                 }

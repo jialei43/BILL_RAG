@@ -21,7 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agents.base_agent import AgentContext  # Agent 上下文
 from app.core.auth import get_current_user, TokenData  # 认证依赖
-from app.core.database import get_db  # 数据库会话依赖
+from app.core.database import get_db, AsyncSessionLocal  # 数据库会话依赖
 from app.core.cache import bill_cache, compute_bill_fingerprint  # 缓存层
 from app.models.agent_models import (
     AuditTask, AuditTaskStatus, AuditTaskType,  # 审核任务 ORM
@@ -93,32 +93,36 @@ async def _run_full_audit(
 
         try:
             orchestrator = OrchestratorAgent()
-            # 把业务类型字符串转为枚举（OrchestratorAgent 需要枚举类型）
             try:
                 audit_task_type = AuditTaskType(task_type)
             except ValueError:
-                audit_task_type = AuditTaskType.FULL_AUDIT  # 无效类型降级为全流程
+                audit_task_type = AuditTaskType.FULL_AUDIT
 
             await orchestrator.run(ctx, db, task_type=audit_task_type)
             logger.info(f"[audit_router] 后台审核完成 task={task_id}")
 
-            # 审核成功完成后，写入最高层审核任务缓存（以票据指纹+业务类型为Key）
-            # 下次提交相同票据相同类型时，直接返回此 task_id，无需重新运行整条流水线
+            # 审核成功完成后，写入最高层审核任务缓存
             if bill_element:
                 bill_fp = compute_bill_fingerprint(bill_element)
                 await bill_cache.set_audit(tenant_id, bill_fp, task_type, task_id)
 
         except Exception as e:
-            # 兜底：更新任务状态为 FAILED，避免任务永远处于 running 状态
-            logger.error(f"[audit_router] 后台审核异常 task={task_id}: {e}")
+            # 兜底：使用独立 session 更新状态为 FAILED（原 db 可能在异常后状态不可靠）
+            logger.error(f"[audit_router] 后台审核异常 task={task_id}: {e}", exc_info=True)
             try:
-                task_record = await db.get(AuditTask, task_id)
-                if task_record:
-                    task_record.status = AuditTaskStatus.FAILED
-                    task_record.error_msg = str(e)[:500]
-                    await db.commit()
+                async with AsyncSessionLocal() as fail_db:
+                    from sqlalchemy import update as sa_update
+                    await fail_db.execute(
+                        sa_update(AuditTask)
+                        .where(AuditTask.id == task_id)
+                        .values(
+                            status=AuditTaskStatus.FAILED,
+                            error_msg=str(e)[:500],
+                        )
+                    )
+                    await fail_db.commit()
             except Exception:
-                pass  # 状态更新失败不影响主流程，已有错误日志
+                pass
 
 
 # ── 接口实现 ───────────────────────────────────────────────────────────────────

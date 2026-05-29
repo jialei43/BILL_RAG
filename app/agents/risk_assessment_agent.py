@@ -68,6 +68,14 @@ class RiskAssessmentAgent(BaseAgent):
         Returns:
             AgentResult: 包含 composite_score / risk_level / 各维度得分
         """
+        logger.info(
+            f"[{self.agent_name}] 开始风险评估 task={ctx.audit_task_id} "
+            f"has_compliance={bool(ctx.shared_data.get('compliance_summary'))} "
+            f"has_endorsement={bool(ctx.shared_data.get('endorsement_result'))} "
+            f"has_contract={bool(ctx.shared_data.get('contract_result'))} "
+            f"has_fraud={bool(ctx.shared_data.get('fraud_result'))}"
+        )
+
         # 步骤 1：从 shared_data 读取各维度中间结果（各 Agent 运行后写入）
         compliance_summary  = ctx.shared_data.get("compliance_summary")   # ComplianceRetrievalAgent 输出
         endorsement_result  = ctx.shared_data.get("endorsement_result")   # EndorsementChainAgent 输出
@@ -138,8 +146,10 @@ class RiskAssessmentAgent(BaseAgent):
 
         logger.info(
             f"[{self.agent_name}] 风险评估完成 "
-            f"composite={composite_score:.1f} level={risk_level.value} "
-            f"missing={missing_dimensions} task={ctx.audit_task_id}"
+            f"task={ctx.audit_task_id} composite={composite_score:.1f} level={risk_level.value} "
+            f"compliance={compliance_score:.1f} endorsement={endorsement_score:.1f} "
+            f"contract={contract_score:.1f} fraud={fraud_score:.1f} "
+            f"missing={missing_dimensions}"
         )
 
         return AgentResult(

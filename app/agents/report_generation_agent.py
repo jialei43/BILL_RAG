@@ -21,6 +21,16 @@ from app.agents.base_agent import BaseAgent, AgentContext, AgentResult
 from app.agents.utils.report_renderer import ReportRenderer
 from app.models.agent_models import AuditReport
 
+# 风险等级 → 中文业务结论
+_RISK_LEVEL_ZH = {
+    "LOW":         "低风险",
+    "MEDIUM_LOW":  "中低风险",
+    "MEDIUM_HIGH": "中高风险",
+    "HIGH":        "高风险",
+    "CRITICAL":    "极高风险",
+    "UNKNOWN":     "风险未知",
+}
+
 
 class ReportGenerationAgent(BaseAgent):
     """
@@ -56,6 +66,14 @@ class ReportGenerationAgent(BaseAgent):
         """
         # 步骤 1：聚合所有维度数据，构建 9 节 JSON 结构
         report_json = self._build_report_json(ctx, training_mode)
+
+        # 步骤 1.5：调用 LLM 生成中文业务解读（不阻断主流程）
+        try:
+            ai_text = await self._generate_ai_interpretation(report_json)
+            if ai_text:
+                report_json["ai_interpretation"] = ai_text
+        except Exception as e:
+            logger.warning(f"[{self.agent_name}] LLM 解读生成失败（不影响报告）: {e}")
 
         # 步骤 2：使用 asyncio.to_thread 在线程池中调用同步 PDF 渲染
         # （reportlab 是同步库，直接调用会阻塞 FastAPI 的异步事件循环）
@@ -183,7 +201,7 @@ class ReportGenerationAgent(BaseAgent):
                 "severe_count":    compliance_summary.get("severe_count"),
                 "compliance_rate": compliance_summary.get("compliance_rate"),
                 "is_compliant":    compliance_summary.get("is_overall_compliant"),
-                "violations":      [],   # 详细违规列表（简化：通过 compliance_checks 表查询）
+                "violations":      compliance_summary.get("violations", []),
             },
             # 节4：背书链分析
             "endorsement": {
@@ -243,26 +261,26 @@ class ReportGenerationAgent(BaseAgent):
         return report
 
     def _gen_conclusion_text(self, risk_level: Optional[str]) -> str:
-        """根据风险等级生成一句话审核结论"""
+        """根据风险等级生成一句话中文审核结论"""
         conclusions = {
-            "LOW":         "Ticket passes compliance review. Auto-approval recommended.",
-            "MEDIUM_LOW":  "Ticket is mostly compliant. Quick manual review recommended.",
-            "MEDIUM_HIGH": "Ticket has notable issues. Full manual review required.",
-            "HIGH":        "Ticket has serious issues. Rejection recommended.",
-            "CRITICAL":    "Ticket has critical violations. Mandatory rejection.",
+            "LOW":         "票据通过合规审核，建议直接办理。",
+            "MEDIUM_LOW":  "票据基本合规，建议快速人工复核后办理。",
+            "MEDIUM_HIGH": "票据存在明显问题，需要人工全面审核。",
+            "HIGH":        "票据存在严重问题，建议拒绝受理。",
+            "CRITICAL":    "票据存在重大违规，必须强制拒绝受理。",
         }
-        return conclusions.get(risk_level or "", "Risk assessment incomplete. Manual review required.")
+        return conclusions.get(risk_level or "", "风险评估未完成，需人工审核。")
 
     def _gen_decision(self, risk_level: Optional[str]) -> str:
-        """根据风险等级生成审核决策"""
+        """根据风险等级生成中文审核决策"""
         decisions = {
-            "LOW":         "APPROVE",
-            "MEDIUM_LOW":  "APPROVE_WITH_REVIEW",
-            "MEDIUM_HIGH": "MANUAL_REVIEW",
-            "HIGH":        "REJECT",
-            "CRITICAL":    "MANDATORY_REJECT",
+            "LOW":         "审核通过",
+            "MEDIUM_LOW":  "有条件通过",
+            "MEDIUM_HIGH": "需人工审核",
+            "HIGH":        "建议拒绝",
+            "CRITICAL":    "强制拒绝",
         }
-        return decisions.get(risk_level or "", "PENDING")
+        return decisions.get(risk_level or "", "待定")
 
     def _gen_recommendations(
         self,
@@ -270,44 +288,115 @@ class ReportGenerationAgent(BaseAgent):
         compliance_summary: dict,
         endorsement_result: dict,
     ) -> list:
-        """生成针对具体问题的改进建议列表"""
+        """生成针对具体问题的中文改进建议列表"""
         recommendations = []
 
         # 合规类建议
-        if compliance_summary.get("severe_count", 0) > 0:
+        severe = compliance_summary.get("severe_count", 0)
+        violation = compliance_summary.get("violation_count", 0)
+        if severe > 0:
             recommendations.append(
-                f"Fix {compliance_summary['severe_count']} severe compliance violations before resubmission."
+                f"存在 {severe} 项严重合规违规，请联系出票人或承兑行补正后重新提交。"
             )
-        if compliance_summary.get("violation_count", 0) > 0:
+        if violation > 0:
             recommendations.append(
-                "Review all flagged compliance fields with your compliance officer."
+                "存在合规风险字段，请与合规部门核对后再推进业务流程。"
             )
 
         # 背书类建议
         if not endorsement_result.get("is_continuous", True):
             recommendations.append(
-                "Endorsement chain is broken. Provide complete endorsement history."
+                "背书链不连续，持票人需补充完整的背书历史记录方可继续流转。"
             )
         if endorsement_result.get("has_cycle", False):
             recommendations.append(
-                "Circular endorsement detected. This may indicate fraudulent activity."
+                "检测到循环背书，存在欺诈嫌疑，建议暂停业务并上报风控部门。"
             )
 
         # 缺失维度建议
         missing = risk_result.get("missing_dimensions", [])
         if "contract" in missing:
             recommendations.append(
-                "Submit supporting contract documentation for contract review."
+                "缺少合同匹配结果，请提供贸易合同原件或扫描件后重新审核。"
             )
         if "fraud" in missing:
             recommendations.append(
-                "Fraud detection was not performed. Manual fraud review required."
+                "未完成欺诈检测，建议人工核查票据真实性。"
             )
 
         # 无建议时的默认提示
         if not recommendations:
             recommendations.append(
-                "No specific issues identified. Standard processing applies."
+                "未发现明确问题，按常规流程处理即可。"
             )
 
         return recommendations
+
+    async def _generate_ai_interpretation(self, report_json: dict) -> str:
+        """
+        调用 LLM 生成面向业务人员的中文审核解读
+
+        输入报告的关键数据，输出自然语言段落，
+        让不懂技术的业务人员也能快速理解审核结果和下一步操作。
+        """
+        from config.settings import settings
+
+        if not settings.OPENAI_API_KEY:
+            return ""  # 未配置 LLM，跳过
+
+        summary    = report_json.get("summary", {})
+        elements   = report_json.get("elements", {})
+        compliance = report_json.get("compliance", {})
+        endorse    = report_json.get("endorsement", {})
+        risk       = report_json.get("risk", {})
+        conclusion = report_json.get("conclusion", {})
+        fraud      = report_json.get("fraud", {})
+
+        risk_level_zh = _RISK_LEVEL_ZH.get(summary.get("risk_level", ""), "未知")
+
+        prompt = f"""你是一位资深票据业务合规顾问。请根据以下票据自动审核结果，为业务人员生成一份通俗易懂的中文解读报告。
+
+【审核数据摘要】
+- 票据号码：{elements.get('ticket_number', '未识别')}
+- 票据类型：{elements.get('ticket_type', '-')}
+- 出票日期：{elements.get('issue_date', '-')}  到期日：{elements.get('due_date', '-')}
+- 票面金额：{elements.get('amount_numeric', '-')}（{elements.get('amount_text', '-')}）
+- 出票人：{elements.get('drawer', '-')}  承兑人：{elements.get('acceptor', '-')}
+- 收款人：{elements.get('payee', '-')}  付款行：{elements.get('drawee_bank', '-')}
+- 综合评分：{summary.get('composite_score', '-')} / 100
+- 风险等级：{risk_level_zh}（{summary.get('risk_level', '')}）
+- 合规检查：共 {compliance.get('total_fields', 0)} 项，违规 {compliance.get('violation_count', 0)} 项（严重 {compliance.get('severe_count', 0)} 项），合规率 {compliance.get('compliance_rate', 0):.1%}
+- 背书链：共 {endorse.get('endorser_count', 0)} 手，连续性 {'正常' if endorse.get('is_continuous', True) else '断裂'}，循环背书 {'有' if endorse.get('has_cycle', False) else '无'}
+- 欺诈风险评分：{fraud.get('overall_fraud_score', '-')}
+- 合规维度得分：{risk.get('compliance_score', '-')}  背书维度：{risk.get('endorsement_score', '-')}  合同维度：{risk.get('contract_score', '-')}  欺诈维度：{risk.get('fraud_score', '-')}
+- 审核决定：{conclusion.get('decision', '-')}
+
+请按以下结构输出中文解读（每节 2-4 句话，合计不超过 400 字）：
+
+**一、整体评价**
+（综合评分和风险等级的业务含义，是否可以办理）
+
+**二、主要问题**
+（列出最关键的 1-3 个问题，说明其业务影响）
+
+**三、操作建议**
+（给出明确的下一步操作建议，业务人员能直接执行）
+
+直接输出解读内容，不要重复审核数据，不要加开场白。"""
+
+        try:
+            import openai
+            client = openai.AsyncOpenAI(
+                api_key=settings.OPENAI_API_KEY,
+                base_url=settings.OPENAI_BASE_URL or None,
+            )
+            response = await client.chat.completions.create(
+                model=settings.OPENAI_MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=600,
+                temperature=0.3,
+            )
+            return response.choices[0].message.content or ""
+        except Exception as e:
+            logger.warning(f"[{self.agent_name}] LLM 解读 API 调用失败: {e}")
+            return ""

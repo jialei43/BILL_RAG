@@ -22,6 +22,7 @@ from sqlalchemy.ext.asyncio import AsyncSession       # 异步数据库会话类
 
 from app.agents.base_agent import AgentContext        # Agent 执行上下文数据类
 from app.core.database import AsyncSessionLocal       # 会话工厂（每次调用创建独立会话）
+from app.core.shared_data_cache import get_shared_data, set_shared_data  # 跨服务 shared_data 持久化
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -138,11 +139,22 @@ async def run_agent_tool(
     agent_name = getattr(agent_instance, "agent_name", "unknown")  # 获取 Agent 名称用于日志
 
     try:
+        # 从 Redis 读取该任务已有的 shared_data，合并到 ctx（Redis 作为基础，本地传入的优先）
+        if ctx.audit_task_id:
+            redis_data = await get_shared_data(ctx.audit_task_id)
+            if redis_data:
+                merged = {**redis_data, **ctx.shared_data}          # 本地 shared_data 优先级更高
+                ctx.shared_data = merged
+
         async with get_db_session() as db:                          # 创建独立数据库会话
             result = await agent_instance.execute(ctx, db, **kwargs)  # 调用 Agent 执行（含计时+日志）
 
             if result.success and commit:
                 await db.commit()                                   # 执行成功时提交数据库变更
+
+            # 无论成功与否，将 Agent 可能更新过的 shared_data 写回 Redis，供后续工具读取
+            if ctx.audit_task_id and ctx.shared_data:
+                await set_shared_data(ctx.audit_task_id, ctx.shared_data)
 
             if not result.success:
                 # Agent 执行失败：返回失败格式（不抛异常，保持 MCP 工具健壮性）

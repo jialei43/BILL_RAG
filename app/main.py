@@ -77,17 +77,17 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"⚠️ LangGraph 检查点初始化失败（不影响服务启动）: {e}")
 
-    # 第五步：初始化 MCP Server（注册所有工具）
-    # 导入 server.py 触发所有 @mcp.tool() 装饰器的工具注册
-    logger.info("初始化 MCP Server（注册工具）...")
+    # 第五步：初始化 MCPClient（连接独立 MCP Server）
+    # 工具执行已迁移到独立 MCP Server（mcp_server_main.py），主应用通过 HTTP 调用
+    logger.info(f"初始化 MCPClient server_url={settings.MCP_SERVER_URL} ...")
     try:
-        from app.mcp.server import mcp as _mcp        # 触发所有工具的注册（副作用导入）
-        logger.info(f"MCP Server 已就绪，共注册工具：{len(list(_mcp._tool_manager._tools))} 个")
+        from app.mcp.client import init_mcp_client
+        await init_mcp_client(settings.MCP_SERVER_URL)
+        logger.info("MCPClient 初始化成功")
     except Exception as e:
-        logger.warning(f"⚠️ MCP Server 初始化失败（不影响其他服务）: {e}")
+        logger.warning(f"⚠️ MCPClient 初始化失败（Agent 工具调用将不可用）: {e}")
 
     # 第六步：预热业务缓存 Redis 连接（懒加载，首次 get/set 时才真正建连接）
-    # 这里只记录日志，实际连接在第一次缓存操作时建立
     from config.settings import settings as _s
     logger.info(f"业务缓存已配置 redis={_s.REDIS_URL} enabled={_s.CACHE_ENABLED}")
 
@@ -102,6 +102,12 @@ async def lifespan(app: FastAPI):
         await teardown_checkpointer()
     except Exception as e:
         logger.warning(f"⚠️ LangGraph 连接池关闭失败: {e}")
+    # 关闭 MCPClient
+    try:
+        from app.mcp.client import close_mcp_client
+        await close_mcp_client()
+    except Exception as e:
+        logger.warning(f"⚠️ MCPClient 关闭失败: {e}")
     # 关闭业务缓存 Redis 连接（释放连接池资源，避免 TCP 连接泄漏）
     await bill_cache.close()
 
@@ -201,16 +207,10 @@ app.include_router(audit_router,    prefix=API_PREFIX)    # 审核任务接口�
 app.include_router(batch_router,    prefix=API_PREFIX)    # 批量任务接口：/api/v1/batch/...
 app.include_router(tracking_router, prefix=API_PREFIX)    # 流转追踪接口：/api/v1/tracking/...
 
-# MCP Server 挂载：将 MCP 作为 ASGI 子应用挂载到 /mcp 路径
-# POST /mcp   → MCP 协议请求（initialize / list_tools / call_tool）
-# GET  /mcp/sse → SSE 事件流（Streamable HTTP 模式）
-# 外部 LLM（Claude API / Claude Desktop）通过此端点调用票据审核工具
-try:
-    from app.mcp.server import get_mcp_asgi_app
-    app.mount("/mcp", get_mcp_asgi_app())              # 挂载 MCP Streamable HTTP ASGI 应用
-    logger.info("MCP Server 已挂载到 /mcp")
-except Exception as e:
-    logger.warning(f"⚠️ MCP Server 挂载失败: {e}")
+# MCP Server 已迁移为独立部署（mcp_server_main.py），主应用不再挂载 /mcp。
+# 若需在开发环境单进程运行，可取消注释以下代码：
+# from app.mcp.server import get_mcp_asgi_app
+# app.mount("/mcp", get_mcp_asgi_app())
 
 # 前端静态文件托管：将 frontend/ 目录挂载到 /frontend 路径
 # 访问 http://localhost:8000/frontend/index.html 即可打开登录页

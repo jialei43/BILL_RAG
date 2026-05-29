@@ -139,21 +139,23 @@ class AgentRegistry:
             logger.warning(f"[agent_registry] 未找到 Agent: {agent_name}")
         return agent_cls
 
-    @classmethod
-    def get_or_raise(cls, agent_name: str) -> Type:
-        """
-        按名称获取 Agent 类，未找到时抛出 KeyError（用于必须存在的 Agent）
+    # 未使用到
 
-        Args:
-            agent_name: Agent 标识符
-
-        Raises:
-            KeyError: 指定名称的 Agent 未注册
-        """
-        agent_cls = cls.get(agent_name)
-        if agent_cls is None:
-            raise KeyError(f"Agent '{agent_name}' 未在注册表中，请检查 agent_registry.py")
-        return agent_cls
+    # @classmethod
+    # def get_or_raise(cls, agent_name: str) -> Type:
+    #     """
+    #     按名称获取 Agent 类，未找到时抛出 KeyError（用于必须存在的 Agent）
+    #
+    #     Args:
+    #         agent_name: Agent 标识符
+    #
+    #     Raises:
+    #         KeyError: 指定名称的 Agent 未注册
+    #     """
+    #     agent_cls = cls.get(agent_name)
+    #     if agent_cls is None:
+    #         raise KeyError(f"Agent '{agent_name}' 未在注册表中，请检查 agent_registry.py")
+    #     return agent_cls
 
     @classmethod
     def all_names(cls) -> list:

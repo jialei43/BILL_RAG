@@ -1675,6 +1675,7 @@ async def consult(
     bill_element_for_rag: Optional[dict] = None  # RAG 路径使用的上下文
     bill_file_bytes: Optional[bytes] = None
     bill_filename: str = ""
+    bill_saved_path: Optional[str] = None       # 落盘后的绝对路径（供 document_parser 节点使用）
 
     if bill_file is not None:
         # 校验文件类型（仅允许图片和 PDF）
@@ -1689,6 +1690,16 @@ async def consult(
             raise HTTPException(status_code=400, detail="上传的票据文件内容为空")
 
         bill_filename = bill_file.filename or ""
+
+        # 落盘：Agent 的 document_parser 节点需要物理文件路径，内存 bytes 无法传递
+        import aiofiles, uuid as _uuid_mod
+        upload_dir = Path(settings.UPLOAD_DIR)
+        upload_dir.mkdir(parents=True, exist_ok=True)
+        safe_name = f"{_uuid_mod.uuid4().hex}_{Path(bill_filename).name}"
+        save_path  = upload_dir / safe_name
+        async with aiofiles.open(save_path, "wb") as f:
+            await f.write(bill_file_bytes)
+        bill_saved_path = str(save_path.resolve())
 
         # 调用视觉识别服务（内部已集成 Redis 缓存，同一文件不重复识别）
         try:
@@ -1770,6 +1781,7 @@ async def consult(
                 tenant_id=current_user.tenant_id,
                 db=db,
                 bill_element_dict=bill_elements_dict,
+                file_path=bill_saved_path,
                 audit_label=audit_label,
                 timeout_seconds=180.0,
             )

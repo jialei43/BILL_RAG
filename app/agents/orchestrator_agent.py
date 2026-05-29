@@ -74,7 +74,9 @@ class OrchestratorAgent(BaseAgent):
             AgentResult: 编排完成后的汇总结果
         """
         logger.info(
-            f"[orchestrator] 开始编排 task={ctx.audit_task_id} type={task_type.value}"
+            f"[orchestrator] 开始编排 "
+            f"task={ctx.audit_task_id} type={task_type.value} "
+            f"tenant={ctx.tenant_id} doc_id={ctx.document_id}"
         )
 
         # ── 步骤 1：将任务状态更新为 RUNNING，记录开始时间 ──────────────────
@@ -90,6 +92,11 @@ class OrchestratorAgent(BaseAgent):
         if not file_path and ctx.document_id:
             # document_id 不为空时，从数据库 documents 表查询文件路径
             file_path = await self._resolve_file_path(ctx.document_id, db)
+
+        logger.info(
+            f"[orchestrator] 文件路径解析完成 task={ctx.audit_task_id} "
+            f"file_path={file_path}"
+        )
 
         # ── 步骤 3：构造 LangGraph 初始状态（替代 AgentContext.shared_data）──
         trace_id = ctx.shared_data.get("trace_id", str(uuid.uuid4())[:8])  # 从 shared_data 获取 trace_id
@@ -144,10 +151,17 @@ class OrchestratorAgent(BaseAgent):
 
         # ── 步骤 6：计算最终状态 ─────────────────────────────────────────────
         failed_nodes = final_state.get("failed_nodes", [])  # 所有失败的节点名称
+        errors       = final_state.get("errors", {})
 
         # 关键节点失败 → 整体任务失败（与原 DAGExecutor 逻辑一致）
-        critical_nodes = self._get_critical_nodes(task_type.value)
+        critical_nodes  = self._get_critical_nodes(task_type.value)
         critical_failed = bool(set(failed_nodes) & set(critical_nodes))
+
+        if failed_nodes:
+            logger.warning(
+                f"[orchestrator] 存在失败节点 task={ctx.audit_task_id} "
+                f"failed={failed_nodes} critical={critical_failed} errors={errors}"
+            )
 
         final_status = AuditTaskStatus.FAILED if critical_failed else AuditTaskStatus.COMPLETED
 
@@ -216,36 +230,56 @@ class OrchestratorAgent(BaseAgent):
         self,
         audit_task_id: str,
         status: AuditTaskStatus,
-        db: AsyncSession,
+        db: AsyncSession = None,           # 保留参数签名兼容性，实际使用独立 session
         progress_pct: Optional[float] = None,
         started_at: Optional[datetime] = None,
         completed_at: Optional[datetime] = None,
     ) -> None:
-        """更新 audit_tasks 表的状态字段（精确字段更新，避免加载整个对象）"""
-        values = {"status": status}                     # 始终更新状态字段
-        if progress_pct is not None:
-            values["progress_pct"] = progress_pct      # 可选：更新进度百分比
-        if started_at is not None:
-            values["started_at"] = started_at          # 可选：记录开始时间
-        if completed_at is not None:
-            values["completed_at"] = completed_at      # 可选：记录完成时间
+        """
+        更新 audit_tasks 表的状态字段（使用独立 session 立即提交）
 
-        stmt = update(AuditTask).where(AuditTask.id == audit_task_id).values(**values)
-        await db.execute(stmt)                          # 执行更新（不提交，外层统一 commit）
+        使用独立 session 而非调用方传入的 db，原因：
+          - 进度更新需要立即对其他 DB 连接可见（前端实时轮询）
+          - 如果用调用方 session，更新只能在请求结束时统一提交，期间查询看不到进度
+        """
+        from app.core.database import AsyncSessionLocal  # 延迟导入避免循环依赖
+
+        values = {"status": status}
+        if progress_pct is not None:
+            values["progress_pct"] = progress_pct
+        if started_at is not None:
+            values["started_at"] = started_at
+        if completed_at is not None:
+            values["completed_at"] = completed_at
+
+        try:
+            async with AsyncSessionLocal() as session:
+                stmt = update(AuditTask).where(AuditTask.id == audit_task_id).values(**values)
+                await session.execute(stmt)
+                await session.commit()              # 立即提交，对其他连接立即可见
+        except Exception as e:
+            logger.warning(f"[orchestrator] 状态更新失败 task={audit_task_id}: {e}")
 
     async def _update_dag_plan(
         self,
         audit_task_id: str,
         dag_json: dict,
-        db: AsyncSession,
+        db: AsyncSession = None,           # 保留兼容性
     ) -> None:
-        """将 LangGraph 图结构信息写入 audit_tasks.dag_plan 字段（供前端渲染流程图）"""
-        stmt = (
-            update(AuditTask)
-            .where(AuditTask.id == audit_task_id)
-            .values(dag_plan=dag_json)
-        )
-        await db.execute(stmt)
+        """将 LangGraph 图结构写入 audit_tasks.dag_plan（使用独立 session 立即提交）"""
+        from app.core.database import AsyncSessionLocal
+
+        try:
+            async with AsyncSessionLocal() as session:
+                stmt = (
+                    update(AuditTask)
+                    .where(AuditTask.id == audit_task_id)
+                    .values(dag_plan=dag_json)
+                )
+                await session.execute(stmt)
+                await session.commit()
+        except Exception as e:
+            logger.warning(f"[orchestrator] dag_plan 更新失败 task={audit_task_id}: {e}")
 
     async def _update_progress_from_event(
         self,
@@ -254,37 +288,35 @@ class OrchestratorAgent(BaseAgent):
         node_delta: dict,
         completed_nodes: list,
         task_type: AuditTaskType,
-        db: AsyncSession,
+        db: AsyncSession = None,           # 保留兼容性
     ) -> None:
         """
-        每个 LangGraph 节点完成后更新 audit_tasks 表的进度和当前节点
+        每个 LangGraph 节点完成后更新 audit_tasks 表的进度（使用独立 session 立即提交）
 
-        替代原 DAGExecutor 的 _update_task_progress() 机制，
-        LangGraph 每完成一个节点就调用一次，前端可实时轮询进度。
-
-        Args:
-            audit_task_id:   任务 UUID
-            node_name:       刚完成的节点名称（如 "parse"、"extract"）
-            node_delta:      该节点产生的状态增量
-            completed_nodes: 已完成节点列表（用于计算进度百分比）
-            task_type:       业务类型（用于确定总节点数）
-            db:              异步数据库会话
+        独立 session + 立即 commit 确保前端实时轮询能看到最新进度。
         """
-        total_nodes = len(self._get_graph_nodes(task_type.value))    # 当前业务类型总节点数
+        from app.core.database import AsyncSessionLocal
+
+        total_nodes = len(self._get_graph_nodes(task_type.value))
         progress_pct = round(len(completed_nodes) / total_nodes * 100.0, 1) if total_nodes > 0 else 0.0
         is_failed = "failed_nodes" in node_delta and node_name in node_delta.get("failed_nodes", [])
 
-        stmt = (
-            update(AuditTask)
-            .where(AuditTask.id == audit_task_id)
-            .values(
-                progress_pct=progress_pct,              # 实时进度（百分比）
-                current_agent=node_name,                # 当前/最后完成的节点名
-            )
-        )
-        await db.execute(stmt)
+        try:
+            async with AsyncSessionLocal() as session:
+                stmt = (
+                    update(AuditTask)
+                    .where(AuditTask.id == audit_task_id)
+                    .values(
+                        progress_pct=progress_pct,
+                        current_agent=node_name,
+                    )
+                )
+                await session.execute(stmt)
+                await session.commit()
+        except Exception as e:
+            logger.warning(f"[orchestrator] 进度更新失败 task={audit_task_id}: {e}")
 
-        log_fn = logger.warning if is_failed else logger.debug
+        log_fn = logger.warning if is_failed else logger.info
         log_fn(
             f"[orchestrator] 节点完成 task={audit_task_id} "
             f"node={node_name} progress={progress_pct:.1f}% failed={is_failed}"
@@ -385,6 +417,7 @@ class OrchestratorAgent(BaseAgent):
         bill_element_dict: Optional[dict] = None,  # 预提取的票据要素（跳过 OCR）
         bill_record_id: Optional[str] = None,       # 已入库票据主档 ID
         document_id: Optional[str] = None,          # 原始文件 ID（用于 Agent 解析）
+        file_path: Optional[str] = None,            # 已落盘的文件绝对路径（供 document_parser 使用）
         audit_label: str = "综合审核",              # 报告标题（前端展示用）
         timeout_seconds: float = 180.0,             # 执行超时保护（秒）
     ) -> dict:
@@ -421,13 +454,16 @@ class OrchestratorAgent(BaseAgent):
             document_id=document_id,
         )
         db.add(audit_task)
-        await db.flush()                             # 让 task_id 在 DB 中可用，事务尚未提交
+        await db.commit()                            # 立即提交，使 MCP 工具的独立 session 可见
 
         # 步骤 2：构建 AgentContext，注入初始 shared_data
         initial_shared: dict = {}
         if bill_element_dict:
             # ElementExtractionAgent 检测到此字段时跳过 Qwen-VL 调用（快速路径）
             initial_shared["bill_element"] = bill_element_dict
+        if file_path:
+            # document_parser 节点从此读取文件路径，避免 file_path=None 导致节点失败
+            initial_shared["file_path"] = file_path
 
         ctx = AgentContext(
             audit_task_id=task_id,
@@ -440,25 +476,28 @@ class OrchestratorAgent(BaseAgent):
         # 步骤 3：在超时保护下执行 LangGraph 图
         try:
             orch_result = await asyncio.wait_for(
-                self.run(ctx, db, task_type=task_type),
+                self.run(ctx, db, task_type=task_type, file_path=file_path),
                 timeout=timeout_seconds,
             )
         except asyncio.TimeoutError:
-            # 超时：任务仍在后台运行，返回 "审核中" 状态，前端可用 task_id 轮询
             logger.warning(
                 f"[orchestrator] 聊天审核超时 task={task_id} timeout={timeout_seconds}s"
+            )
+            # 超时时立即将任务状态更新为 FAILED（避免任务永远停留在 RUNNING）
+            await self._update_task_status(
+                audit_task_id=task_id,
+                status=AuditTaskStatus.FAILED,
             )
             elapsed_ms = (time.perf_counter() - t0) * 1000
             return {
                 "task_id":       task_id,
-                "conclusion":    "审核中",
+                "conclusion":    "审核超时",
                 "risk_level":    "UNKNOWN",
                 "overall_score": None,
                 "issues":        [],
                 "summary":       (
-                    f"审核任务已创建（ID: {task_id[:8]}…），"
-                    f"处理超过 {timeout_seconds:.0f} 秒，"
-                    f"请通过任务查询接口获取最终结果。"
+                    f"审核任务（ID: {task_id[:8]}…）处理超过 {timeout_seconds:.0f} 秒后超时，"
+                    f"请稍后通过任务查询接口重试或联系管理员。"
                 ),
                 "elapsed_ms":    elapsed_ms,
                 "timed_out":     True,
@@ -487,17 +526,19 @@ class OrchestratorAgent(BaseAgent):
         """
         issues: list[dict] = []
 
-        # ── 从合规检索结果提取问题 ────────────────────────────────────────────
+        # ── 从合规检索结果提取问题（violations 列表包含每字段违规明细）────────
         compliance_summary = ctx.shared_data.get("compliance_summary", {})
-        for field, result in compliance_summary.items():
-            if isinstance(result, dict) and not result.get("is_compliant", True):
-                level = result.get("violation_level", "warning")
-                issues.append({
-                    "field":          field,
-                    "level":          level if level in ("error", "warning", "info") else "warning",
-                    "description":    result.get("violation_desc", f"{field} 合规检查不通过"),
-                    "recommendation": result.get("recommendation"),
-                })
+        for v in compliance_summary.get("violations", []):
+            raw_level = v.get("violation_level") or "warning"
+            # ViolationLevel.SEVERE → "error"，WARNING → "warning"，INFO → "info"
+            level_map = {"severe": "error", "warning": "warning", "info": "info"}
+            level = level_map.get(raw_level, "warning")
+            issues.append({
+                "field":          v.get("field", "unknown"),
+                "level":          level,
+                "description":    v.get("violation_desc") or f"字段 {v.get('field')} 合规检查不通过",
+                "recommendation": v.get("regulation_ref"),
+            })
 
         # ── 从背书链结果提取问题 ──────────────────────────────────────────────
         endorsement_result = ctx.shared_data.get("endorsement_result", {})

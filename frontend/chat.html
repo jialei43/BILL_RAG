@@ -635,6 +635,24 @@
       font-size: 11px; color: var(--text-muted); flex-wrap: wrap;
     }
 
+    /* 报告下载操作栏 */
+    .report-actions {
+      display: flex; gap: 8px; align-items: center; flex-wrap: wrap;
+      padding: 10px 16px 12px; border-top: 1px solid var(--border);
+      background: #fff;
+    }
+    .btn-download {
+      display: inline-flex; align-items: center; gap: 5px;
+      padding: 5px 12px; border-radius: 6px; border: 1px solid;
+      font-size: 12px; font-weight: 500; cursor: pointer;
+      transition: opacity .15s;
+    }
+    .btn-download:hover { opacity: .8; }
+    .btn-download:active { transform: scale(.97); }
+    .btn-download.json { background: #eff6ff; color: #1d4ed8; border-color: #bfdbfe; }
+    .btn-download.pdf  { background: #fef2f2; color: #b91c1c; border-color: #fecaca; }
+    .btn-download:disabled { opacity: .5; cursor: not-allowed; transform: none; }
+
     /* ── 响应式 ──────────────────────────────────────────────────────────────── */
     @media (max-width: 900px) {
       .source-panel { display: none; }            /* 小屏幕隐藏来源面板 */
@@ -1068,6 +1086,63 @@
    * @param {ConsultResponse} result - 后端返回的完整响应对象
    * @param {string} time - 消息时间 ISO 字符串
    */
+  async function downloadReportJson(taskId, btn) {
+    btn.disabled = true;
+    btn.textContent = '下载中…';
+    try {
+      const token = Auth.getToken();
+      const resp = await fetch(
+        `${CONFIG.API_BASE}${CONFIG.API_PREFIX}/audit/tasks/${taskId}/report`,
+        { headers: token ? { Authorization: `Bearer ${token}` } : {} }
+      );
+      if (!resp.ok) {
+        const err = await resp.json().catch(() => ({}));
+        throw new Error(err.detail || `HTTP ${resp.status}`);
+      }
+      const data = await resp.json();
+      const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = `audit_report_${taskId.slice(0, 8)}.json`;
+      a.click();
+      URL.revokeObjectURL(a.href);
+      btn.textContent = '⬇ JSON 报告';
+    } catch (e) {
+      btn.textContent = e.message.includes('404') ? '报告生成中' : '下载失败';
+      setTimeout(() => { btn.textContent = '⬇ JSON 报告'; }, 2500);
+    } finally {
+      btn.disabled = false;
+    }
+  }
+
+  async function downloadReportPdf(taskId, btn) {
+    btn.disabled = true;
+    btn.textContent = '下载中…';
+    try {
+      const token = Auth.getToken();
+      const resp = await fetch(
+        `${CONFIG.API_BASE}${CONFIG.API_PREFIX}/audit/tasks/${taskId}/report/pdf`,
+        { headers: token ? { Authorization: `Bearer ${token}` } : {} }
+      );
+      if (!resp.ok) {
+        const err = await resp.json().catch(() => ({}));
+        throw new Error(err.detail || `HTTP ${resp.status}`);
+      }
+      const blob = await resp.blob();
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = `audit_report_${taskId.slice(0, 8)}.pdf`;
+      a.click();
+      URL.revokeObjectURL(a.href);
+      btn.textContent = '⬇ PDF 报告';
+    } catch (e) {
+      btn.textContent = e.message.includes('404') ? '报告生成中' : '下载失败';
+      setTimeout(() => { btn.textContent = '⬇ PDF 报告'; }, 2500);
+    } finally {
+      btn.disabled = false;
+    }
+  }
+
   function buildReportCardElement(result, time) {
     const row = document.createElement('div');
     row.className = 'message-row ai';
@@ -1128,6 +1203,14 @@
               ${r.elapsed_ms ? `<span>· 耗时 ${Utils.formatDuration(r.elapsed_ms)}</span>` : ''}
               ${result.total_ms ? `<span>· 总计 ${Utils.formatDuration(result.total_ms)}</span>` : ''}
             </div>
+          </div>
+          <div class="report-actions">
+            <button class="btn-download json" onclick="downloadReportJson('${Utils.escapeHtml(r.task_id)}', this)">
+              ⬇ JSON 报告
+            </button>
+            <button class="btn-download pdf" onclick="downloadReportPdf('${Utils.escapeHtml(r.task_id)}', this)">
+              ⬇ PDF 报告
+            </button>
           </div>
         </div>`;
 

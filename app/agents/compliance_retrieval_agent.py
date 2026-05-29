@@ -74,7 +74,18 @@ class ComplianceRetrievalAgent(BaseAgent):
         """
         # 步骤 1：从 shared_data 读取要素（由 ElementExtractionAgent 预先写入）
         bill_element = ctx.shared_data.get("bill_element")
+
+        logger.info(
+            f"[{self.agent_name}] 开始合规检索 task={ctx.audit_task_id} "
+            f"ticket={bill_element.get('ticket_number') if bill_element else None} "
+            f"has_element={bool(bill_element)}"
+        )
+
         if not bill_element:
+            logger.error(
+                f"[{self.agent_name}] 缺少 bill_element，合规检索无法执行 "
+                f"task={ctx.audit_task_id}"
+            )
             return AgentResult(
                 agent_name=self.agent_name,
                 success=False,
@@ -99,7 +110,7 @@ class ComplianceRetrievalAgent(BaseAgent):
             # 将缓存数据写入本次审核任务（每次审核都需要独立的 DB 记录）
             for c in cached_checks:
                 db.add(ComplianceCheck(
-                    id=__import__("uuid").uuid4().hex,
+                    id=str(uuid.uuid4()),
                     audit_task_id=ctx.audit_task_id,
                     element_field=c.get("element_field"),
                     element_value=c.get("element_value"),
@@ -112,12 +123,23 @@ class ComplianceRetrievalAgent(BaseAgent):
                 ))
             total_fields = len(cached_checks)
             compliance_rate = round((total_fields - violation_count) / total_fields, 3)
+            violations = [
+                {
+                    "field":          c["element_field"],
+                    "violation_level": c.get("violation_level"),
+                    "violation_desc":  c.get("violation_desc"),
+                    "regulation_ref":  c.get("regulation_ref"),
+                }
+                for c in cached_checks
+                if not c.get("is_compliant") and c.get("violation_level") != ViolationLevel.INFO.value
+            ]
             ctx.shared_data["compliance_summary"] = {
                 "total_fields":       total_fields,
                 "violation_count":    violation_count,
                 "severe_count":       severe_count,
                 "compliance_rate":    compliance_rate,
                 "is_overall_compliant": severe_count == 0,
+                "violations":         violations,   # 每字段违规明细（供聊天报告展示）
                 "from_cache":         True,
             }
             return AgentResult(
@@ -128,6 +150,8 @@ class ComplianceRetrievalAgent(BaseAgent):
                     "severe_count":    severe_count,
                     "compliance_rate": compliance_rate,
                     "total_fields":    total_fields,
+                    "violations":      violations,   # 每字段违规明细，供 LangGraph state 传递
+                    "is_overall_compliant": severe_count == 0,
                     "from_cache":      True,
                 },
             )
@@ -138,6 +162,8 @@ class ComplianceRetrievalAgent(BaseAgent):
             f"fields={len(FIELD_QUERY_TEMPLATES)} task={ctx.audit_task_id}"
         )
 
+        ticket_type = bill_element.get("ticket_type") or ""  # 票据类型，用于区分必填规则
+
         # 构建并发任务列表：每个字段对应一个 RAG 查询任务
         tasks = [
             self._check_field(
@@ -146,6 +172,7 @@ class ComplianceRetrievalAgent(BaseAgent):
                 query_template=query_tpl,
                 regulation_ref=regulation,
                 audit_task_id=ctx.audit_task_id,
+                ticket_type=ticket_type,
             )
             for field_name, (query_tpl, regulation) in FIELD_QUERY_TEMPLATES.items()
         ]
@@ -167,12 +194,24 @@ class ComplianceRetrievalAgent(BaseAgent):
         total_fields = len(check_results)
         compliance_rate = round((total_fields - violation_count) / total_fields, 3)
 
+        violations = [
+            {
+                "field":          c.element_field,
+                "violation_level": c.violation_level.value if c.violation_level else None,
+                "violation_desc":  c.violation_desc,
+                "regulation_ref":  c.regulation_ref,
+            }
+            for c in check_results
+            if not c.is_compliant and c.violation_level != ViolationLevel.INFO
+        ]
+
         ctx.shared_data["compliance_summary"] = {
             "total_fields":    total_fields,
             "violation_count": violation_count,
             "severe_count":    severe_count,
             "compliance_rate": compliance_rate,     # 合规率：0.0~1.0
-            "is_overall_compliant": severe_count == 0,  # 无严重违规才算整体合规
+            "is_overall_compliant": severe_count == 0,
+            "violations":      violations,          # 每字段违规明细（供聊天报告展示）
         }
 
         # 步骤 6：写入合规检索缓存（只缓存可序列化的字段，不含 ORM 对象）
@@ -185,7 +224,7 @@ class ComplianceRetrievalAgent(BaseAgent):
                 "rag_answer":      c.rag_answer,
                 "is_compliant":    c.is_compliant,
                 "violation_level": c.violation_level.value if c.violation_level else None,
-                "violation_desc": c.violation_desc,
+                "violation_desc":  c.violation_desc,
             }
             for c in check_results
         ]
@@ -206,6 +245,7 @@ class ComplianceRetrievalAgent(BaseAgent):
                 "severe_count":    severe_count,
                 "compliance_rate": compliance_rate,
                 "is_overall_compliant": severe_count == 0,
+                "violations":      violations,   # 每字段违规明细，供 LangGraph state 传递
             },
         )
 
@@ -216,6 +256,7 @@ class ComplianceRetrievalAgent(BaseAgent):
         query_template: str,
         regulation_ref: str,
         audit_task_id: str,
+        ticket_type: str = "",
     ) -> ComplianceCheck:
         """
         单字段合规检查：向知识库查询该字段的合规要求，并判断字段值是否符合
@@ -226,6 +267,7 @@ class ComplianceRetrievalAgent(BaseAgent):
             query_template: 合规查询问句
             regulation_ref: 相关法规引用
             audit_task_id:  任务 ID（用于外键）
+            ticket_type:    票据类型（用于区分银行本票/银行承兑汇票等必填规则差异）
 
         Returns:
             ComplianceCheck: 可直接 db.add() 的 ORM 对象
@@ -244,9 +286,9 @@ class ComplianceRetrievalAgent(BaseAgent):
             logger.warning(f"[{self.agent_name}] 字段 {field_name} RAG 检索异常: {e}")
             rag_answer, rag_score = "知识库检索异常，请人工核查", 0.0
 
-        # 根据字段值和 RAG 结果判断合规性
+        # 根据字段值和 RAG 结果判断合规性（传入 ticket_type 区分必填规则）
         is_compliant, violation_level, violation_desc, suggestion = (
-            self._judge_compliance(field_name, field_value, rag_answer, rag_score)
+            self._judge_compliance(field_name, field_value, rag_answer, rag_score, ticket_type)
         )
 
         return ComplianceCheck(
@@ -293,35 +335,86 @@ class ComplianceRetrievalAgent(BaseAgent):
             logger.warning(f"[{self.agent_name}] RAG 检索异常: {e}")
             return "知识库检索异常，请人工核查", 0.0
 
+    # 字段名到中文显示名的映射（用于生成可读的违规描述）
+    _FIELD_ZH = {
+        "ticket_number":    "票据号码",
+        "ticket_type":      "票据种类",
+        "issue_date":       "出票日期",
+        "due_date":         "到期日期",
+        "amount_numeric":   "票面金额（数字）",
+        "amount_text":      "票面金额（大写）",
+        "currency":         "币种",
+        "drawer":           "出票人",
+        "drawer_account":   "出票人账号",
+        "drawer_bank":      "出票人开户行",
+        "acceptor":         "承兑人",
+        "payee":            "收款人",
+        "drawee_bank":      "付款行",
+        "endorsers":        "背书人",
+        "maturity_days":    "距到期天数",
+        "trade_purpose":    "贸易背景",
+        "acceptance_clause": "承兑条款",
+        "special_remarks":  "特殊记载事项",
+    }
+
     def _judge_compliance(
         self,
         field_name: str,
         field_value,
         rag_answer: str,
         rag_score: float,
+        ticket_type: str = "",
     ) -> tuple:
         """
-        根据字段值和 RAG 答案判断合规性
-        判断逻辑：字段为空 → 违规；RAG 分数低 → 无法判断（按合规处理）；否则通过
+        根据字段值、票据类型和 RAG 答案判断合规性
+
+        必填规则按票据类型区分：
+          - 银行本票：出票人银行自身即为承兑方，acceptor / drawee_bank 不单独要求
+          - 银行承兑汇票 / 商业承兑汇票：acceptor 和 drawee_bank 均为必填
 
         Returns:
             (is_compliant, violation_level, violation_desc, suggestion)
         """
-        # 必填字段为空：直接违规（严重）
-        required_fields = {
-            "ticket_number", "ticket_type", "issue_date", "due_date",
-            "amount_numeric", "drawer", "acceptor", "payee", "drawee_bank",
-        }
+        field_zh = self._FIELD_ZH.get(field_name, field_name)   # 始终用中文字段名
 
+        # ── 各票据类型的必填字段集合 ──────────────────────────────────────────
+        # 所有类型共有的必填字段
+        _common_required = {
+            "ticket_number", "ticket_type", "issue_date", "due_date",
+            "amount_numeric", "drawer", "payee",
+        }
+        # 银行承兑汇票 / 商业承兑汇票：承兑人和付款行也是必填
+        _acceptance_required = _common_required | {"acceptor", "drawee_bank"}
+        # 银行本票：银行本身即为出票兼承兑方，acceptor 和 drawee_bank 不单独要求
+        _promissory_required = _common_required
+
+        is_bank_promissory  = "本票" in ticket_type                      # 银行本票
+        is_acceptance_bill  = "承兑汇票" in ticket_type or not ticket_type  # 汇票（含未知类型）
+
+        if is_bank_promissory:
+            required_fields = _promissory_required
+        else:
+            required_fields = _acceptance_required   # 汇票及未知类型都要求承兑人
+
+        # ── 必填字段为空：严重违规 ────────────────────────────────────────────
         if field_name in required_fields and not field_value:
             return (
                 False,
                 ViolationLevel.SEVERE,
-                f"必填字段「{field_name}」为空",
-                f"请补充填写票据的「{field_name}」字段",
+                f"必填字段「{field_zh}」为空",
+                f"请补充填写票据的「{field_zh}」字段",
             )
 
-        # 贸易背景字段为空：警告级（贴现时必须填写，其他业务可为空）
+        # ── 承兑人为空但票据类型为银行本票：提示级（不违规，说明原因）─────────
+        if field_name == "acceptor" and not field_value and is_bank_promissory:
+            return (
+                True,
+                ViolationLevel.INFO,
+                None,
+                None,
+            )
+
+        # ── 贸易背景为空：警告级（贴现时必须填写）────────────────────────────
         if field_name == "trade_purpose" and not field_value:
             return (
                 False,
@@ -330,13 +423,9 @@ class ComplianceRetrievalAgent(BaseAgent):
                 "如申请贴现，请补充填写贸易背景说明",
             )
 
-        # RAG 检索到明确规定且字段有值：认为合规
+        # ── RAG 检索到明确规定且字段有值：合规 ───────────────────────────────
         if rag_score >= RAG_COMPLIANCE_THRESHOLD and field_value:
             return True, ViolationLevel.INFO, None, None
 
-        # RAG 未找到明确规定：给出提示但不标记违规（知识库可能覆盖不全）
-        if rag_score < RAG_COMPLIANCE_THRESHOLD:
-            return True, ViolationLevel.INFO, None, None
-
-        # 其他情况：默认合规
+        # ── 其他情况（RAG 未找到明确规定）：默认合规，不阻断业务 ───────────
         return True, ViolationLevel.INFO, None, None

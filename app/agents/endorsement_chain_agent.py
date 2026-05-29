@@ -60,9 +60,15 @@ class EndorsementChainAgent(BaseAgent):
         """
         # 步骤 1：从 shared_data 读取要素
         bill_element = ctx.shared_data.get("bill_element", {})
-        drawer  = bill_element.get("drawer")   # 出票人（背书链起点）
-        payee   = bill_element.get("payee")    # 初始收款人
+        drawer    = bill_element.get("drawer")   # 出票人（背书链起点）
+        payee     = bill_element.get("payee")    # 初始收款人
         endorsers: List[str] = bill_element.get("endorsers") or []  # 背书人顺序列表
+
+        logger.info(
+            f"[{self.agent_name}] 开始背书链分析 task={ctx.audit_task_id} "
+            f"ticket={bill_element.get('ticket_number')} "
+            f"drawer={drawer} payee={payee} endorsers_count={len(endorsers)}"
+        )
 
         # 步骤 2：构建有向图
         # 节点：出票人 + 收款人 + 所有背书人
@@ -109,10 +115,16 @@ class EndorsementChainAgent(BaseAgent):
             "violation_codes": list(violations.keys()),
         }
 
+        if violations:
+            logger.warning(
+                f"[{self.agent_name}] 发现背书违规 task={ctx.audit_task_id} "
+                f"codes={list(violations.keys())} "
+                f"details={[ENDORSEMENT_VIOLATION_RULES.get(c, c) for c in violations]}"
+            )
         logger.info(
             f"[{self.agent_name}] 背书链分析完成 "
-            f"endorsers={len(endorsers)} violations={len(violations)} "
-            f"continuous={is_continuous} task={ctx.audit_task_id}"
+            f"task={ctx.audit_task_id} endorsers={len(endorsers)} "
+            f"violations={len(violations)} continuous={is_continuous} cycle={has_cycle}"
         )
 
         return AgentResult(
