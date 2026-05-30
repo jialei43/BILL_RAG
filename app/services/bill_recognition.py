@@ -160,8 +160,8 @@ class BillRecognitionService:
             logger.warning(f"BillRecognition: unsupported file type: {suffix}")
             return RecognitionResult()   # 所有字段默认值，bills 为空
 
-        bills = []        # 收集每页识别出的票据要素
-        raw_texts = []    # 收集每页的原始文本（调试用）
+        page_bills = []   # 每页识别出的原始 BillElement（合并前）
+        raw_texts  = []   # 每页的原始文本（调试用）
 
         for i, img_bytes in enumerate(image_list):   # 逐页处理
             logger.info(f"BillRecognition: processing page {i + 1}/{len(image_list)}")
@@ -169,13 +169,17 @@ class BillRecognitionService:
             raw_texts.append(raw_text)                # 保存原始文本
 
             bill = self._parse_bill_json(raw_text)    # 尝试解析 JSON 为 BillElement
-            if bill is not None:                      # 解析成功
-                bills.append(bill)                    # 加入结果列表
+            if bill is not None:
+                page_bills.append(bill)
+
+        # 多页合并：一张票据可能跨多页（正面 + 背书页），将所有页合并为一个 BillElement
+        # 主要字段（票号、金额、出票人等）取第一个非空值，endorsers 跨页汇总追加
+        bills = self._merge_pages(page_bills)
 
         elapsed_ms = (time.perf_counter() - t_start) * 1000   # 计算总耗时（毫秒）
         logger.info(
-            f"BillRecognition: done, {len(bills)} bills found "
-            f"in {len(image_list)} pages, {elapsed_ms:.0f}ms"
+            f"BillRecognition: done, {len(page_bills)} pages → {len(bills)} bills "
+            f"(after merge), {elapsed_ms:.0f}ms"
         )
 
         result = RecognitionResult(
@@ -208,6 +212,50 @@ class BillRecognitionService:
                 logger.debug(f"BillRecognition: 缓存写入跳过: {e}")
 
         return result
+
+    def _merge_pages(self, page_bills: list) -> list:
+        """
+        将多页识别结果合并为一个 BillElement。
+
+        票据 PDF 通常结构为：第1页=票面正面（含票号/金额/出票人等主要字段），
+        后续页=背书页（仅含背书人列表，其他字段为 null）。
+        逐页独立识别会导致背书人散落在多个 BillElement 中，此方法将其合并：
+          - 主要字段：取第一个非 None 值（正面页优先）
+          - endorsers：跨所有页追加去重，保留顺序
+        """
+        valid = [b for b in page_bills if b.is_bill_found]
+        if not valid:
+            return []
+
+        merged = BillElement(is_bill_found=True)
+        scalar_fields = [
+            "ticket_type", "ticket_number", "issue_date", "due_date",
+            "amount_numeric", "amount_text", "currency",
+            "drawer", "drawer_account", "drawer_bank",
+            "acceptor", "payee", "drawee_bank",
+        ]
+
+        # 主要字段取第一个非 None 值
+        for field in scalar_fields:
+            for page_bill in valid:
+                val = getattr(page_bill, field)
+                if val is not None:
+                    setattr(merged, field, val)
+                    break
+
+        # endorsers 跨页汇总，保留顺序并去重
+        seen: set = set()
+        for page_bill in valid:
+            for endorser in (page_bill.endorsers or []):
+                if endorser and endorser not in seen:
+                    merged.endorsers.append(endorser)
+                    seen.add(endorser)
+
+        logger.info(
+            f"BillRecognition: merged {len(valid)} valid pages → "
+            f"ticket={merged.ticket_number} endorsers={len(merged.endorsers)}"
+        )
+        return [merged]
 
     def _pdf_to_images(self, pdf_bytes: bytes) -> list[bytes]:
         """

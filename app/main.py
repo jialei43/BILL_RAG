@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+import asyncio                            # 异步任务调度（断点续作后台任务）
 import os                                # Python 标准库，用于设置进程级环境变量
 import time                              # Python 标准库，用于计时（记录每个请求的处理时长）
 import uuid                              # 生成唯一请求 ID，用于全链路日志追踪
@@ -42,6 +43,59 @@ from app.core.cache import bill_cache  # 业务缓存实例（lifespan 关闭时
 from app.api.audit_router import audit_router       # 审核任务路由：提交/查询/报告下载
 from app.api.batch_router import batch_router       # 批量审核路由：批次提交/进度查询/子项列表
 from app.api.tracking_router import tracking_router  # 流转追踪路由：创建追踪/查询状态/报文详情
+
+
+async def _recover_interrupted_tasks() -> None:
+    """
+    重启后恢复进程崩溃前处于 RUNNING 状态的任务。
+
+    LangGraph 已将每个节点完成后的 state 持久化到 PostgreSQL checkpoints 表，
+    只需对相同 thread_id（= audit_task_id）重新调用 graph.astream()，
+    框架会自动从上次完成的节点之后继续执行，无需重跑已完成的节点。
+
+    此函数作为后台任务运行（asyncio.create_task），不阻塞服务器启动接收新请求。
+    """
+    from sqlalchemy import select
+    from app.core.database import AsyncSessionLocal
+    from app.models.agent_models import AuditTask, AuditTaskStatus
+    from app.agents.orchestrator_agent import OrchestratorAgent
+    from app.agents.base_agent import AgentContext
+
+    try:
+        async with AsyncSessionLocal() as query_db:
+            result = await query_db.execute(
+                select(AuditTask).where(AuditTask.status == AuditTaskStatus.RUNNING)
+            )
+            interrupted = result.scalars().all()
+
+        if not interrupted:
+            logger.info("[recovery] 无需恢复：没有中断的 RUNNING 任务")
+            return
+
+        logger.warning(f"[recovery] 发现 {len(interrupted)} 个中断任务，开始断点续作")
+
+        orchestrator = OrchestratorAgent()
+
+        for task in interrupted:
+            async def _resume(t: AuditTask) -> None:
+                try:
+                    async with AsyncSessionLocal() as db:
+                        ctx = AgentContext(
+                            audit_task_id=t.id,
+                            tenant_id=t.tenant_id,
+                            document_id=t.document_id,
+                            shared_data={},
+                        )
+                        await orchestrator.run(ctx, db, task_type=t.task_type)
+                    logger.info(f"[recovery] 任务续跑完成 task={t.id}")
+                except Exception as e:
+                    logger.error(f"[recovery] 任务续跑失败 task={t.id} error={e}")
+
+            asyncio.create_task(_resume(task))
+            logger.info(f"[recovery] 已提交续跑任务 task={task.id} type={task.task_type}")
+
+    except Exception as e:
+        logger.error(f"[recovery] 恢复流程异常，跳过断点续作: {e}")
 
 
 # ── 启动 / 关闭生命周期管理 ────────────────────────────────────────────────────
@@ -90,6 +144,10 @@ async def lifespan(app: FastAPI):
     # 第六步：预热业务缓存 Redis 连接（懒加载，首次 get/set 时才真正建连接）
     from config.settings import settings as _s
     logger.info(f"业务缓存已配置 redis={_s.REDIS_URL} enabled={_s.CACHE_ENABLED}")
+
+    # 第七步：恢复进程崩溃前处于 RUNNING 状态的任务（断点续作）
+    # 所有基础设施（DB / checkpointer / MCPClient）已就绪，可以安全触发续跑
+    asyncio.create_task(_recover_interrupted_tasks())
 
     logger.info("✅ 系统启动完成")
     yield   # 程序运行阶段：yield 之后暂停，等待应用正常运行……
