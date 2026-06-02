@@ -1749,6 +1749,7 @@ async def consult(
             bill_elements_dict = bill_element_for_rag
 
     # ── 步骤 2：意图识别 ──────────────────────────────────────────────────────
+    #   1. 识别意图，置信度，识别方式（关键词、缓存、llm意图识别）
     intent_id, confidence, intent_method = await intent_router.classify(query)
 
     logger.info(

@@ -66,7 +66,9 @@ async def lifespan(app: FastAPI):
     tool_count = len(list(_mcp._tool_manager._tools))
     logger.info(f"✅ MCP Server 启动完成，已注册工具：{tool_count} 个")
 
-    yield
+    # 启动 StreamableHTTPSessionManager（FastAPI mount 不会触发子应用 lifespan，须手动调用）
+    async with _mcp.session_manager.run():
+        yield
 
     logger.info("🛑 MCP Server 关闭")
     from app.core.cache import bill_cache
@@ -84,5 +86,6 @@ app = FastAPI(
 )
 
 # 挂载 MCP ASGI 子应用（Streamable HTTP 传输模式）
+# streamable_http_app() 内部已注册 /mcp 路由，挂载到根路径避免路径双重前缀（/mcp/mcp）
 from app.mcp.server import get_mcp_asgi_app
-app.mount("/mcp", get_mcp_asgi_app())
+app.mount("/", get_mcp_asgi_app())

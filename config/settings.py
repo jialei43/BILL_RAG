@@ -122,7 +122,7 @@ class Settings(BaseSettings):
     LOG_COMPRESSION: str = "gz"          # 轮转后用 gzip 压缩，节省磁盘空间
 
     # ── MCP 独立部署配置 ──────────────────────────────────────────────────────
-    MCP_SERVER_URL: str = "http://localhost:8001/mcp"  # 独立 MCP Server 地址（主应用通过此地址调用工具）
+    MCP_SERVER_URL: str = "http://localhost:8003/mcp"  # 独立 MCP Server 地址（主应用通过此地址调用工具）
 
     # ── 监控配置 ──────────────────────────────────────────────────────────────
     PROMETHEUS_ENABLED: bool = True       # 是否开启 Prometheus 监控数据采集
